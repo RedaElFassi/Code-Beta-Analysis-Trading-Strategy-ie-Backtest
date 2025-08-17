@@ -20,7 +20,7 @@ MATU_LONG  = "10Y"
 MATU_SHORT = "5Y"
 MATU_SPREAD = "10Y"      # maturité du SPREAD pour OLS & backtest
 
-# Fenêtres (en NOMBRE D'OBSERVATIONS) — UNE SEULE fenêtre
+# Fenêtres (en NOMBRE D'OBSERVATIONS)
 ROLLING_WINDOW_DAYS = 126    # ex: 63 / 126 / 252
 OBS_WINDOW_DAYS     = 21     # 1 "mois" = 21 obs (cooldown)
 HOLDING_DAYS        = 21     # max de détention (en obs)
@@ -70,8 +70,6 @@ def build_master_dataframe(
           * NIVEAUX:  BOX ~ SPREAD, BOX ~ CURVE
           * DAILY Δ:  dBOX ~ dSPREAD, dBOX ~ dCURVE
         Chacune écrit: alpha/beta/r2/tstat/resid, suffixées `_w{window}`.
-
-    Tout est stocké **une fois**, pour être réutilisé (plots & backtest).
     """
     if not isinstance(data.index, pd.DatetimeIndex):
         data = data.copy()
@@ -92,22 +90,24 @@ def build_master_dataframe(
         _col(curve_country, matu_short),
     ]
     missing = [c for c in cols_needed if c not in data.columns]
-    if len(missing) > 0:
+    if missing:
         raise KeyError(f"Colonnes manquantes dans `data`: {missing}")
 
     # 1) Taux en bps (data en % → *100)
-    master[_col_bps(country_high, matu_long)]  = data[_col(country_high, matu_long)]  * 100.0
-    master[_col_bps(country_low,  matu_long)]  = data[_col(country_low,  matu_long)]  * 100.0
-    master[_col_bps(country_high, matu_short)] = data[_col(country_high, matu_short)] * 100.0
-    master[_col_bps(country_low,  matu_short)] = data[_col(country_low,  matu_short)] * 100.0
+    master[_col_bps(country_high, matu_long)]  = data[_col(country_high, matu_long)].astype(float)  * 100.0
+    master[_col_bps(country_low,  matu_long)]  = data[_col(country_low,  matu_long)].astype(float)  * 100.0
+    master[_col_bps(country_high, matu_short)] = data[_col(country_high, matu_short)].astype(float) * 100.0
+    master[_col_bps(country_low,  matu_short)] = data[_col(country_low,  matu_short)].astype(float) * 100.0
 
     # 2) Séries dérivées en bps
     master["BOX_bps"] = (
         master[_col_bps(country_high, matu_long)] - master[_col_bps(country_low,  matu_long)]
         - (master[_col_bps(country_high, matu_short)] - master[_col_bps(country_low,  matu_short)])
     )
-    master["SPREAD_bps"] = (data[_col(country_high, matu_spread)] - data[_col(country_low, matu_spread)]) * 100.0
-    master["CURVE_bps"]  = (data[_col(curve_country, matu_long)] - data[_col(curve_country, matu_short)]) * 100.0
+    master["SPREAD_bps"] = (data[_col(country_high, matu_spread)].astype(float)
+                            - data[_col(country_low, matu_spread)].astype(float)) * 100.0
+    master["CURVE_bps"]  = (data[_col(curve_country, matu_long)].astype(float)
+                            - data[_col(curve_country, matu_short)].astype(float)) * 100.0
 
     # 3) Daily changes
     master["dBOX_bps"]    = master["BOX_bps"].diff()
@@ -124,19 +124,16 @@ def build_master_dataframe(
         y = master[ycol]
         x = master[xcol]
         df = pd.concat([y.rename("y"), x.rename("x")], axis=1).dropna()
-        # pré-crée des NaN pour toute la timeline
-        master[f"{prefix}_alpha_w{w}"] = np.nan
-        master[f"{prefix}_beta_w{w}"]  = np.nan
-        master[f"{prefix}_r2_w{w}"]    = np.nan
-        master[f"{prefix}_tstat_w{w}"] = np.nan
-        master[f"{prefix}_resid_w{w}"] = np.nan
+        # colonnes vides pour toute la timeline (seront remplies aux dates fin-fenêtre)
+        for suff in ["alpha","beta","r2","tstat","resid"]:
+            master[f"{prefix}_{suff}_w{w}"] = np.nan
 
         if len(df) < w:
             return
 
         yv = df["y"].values
         xv = df["x"].values
-        dfi = df.index  # dates disponibles (sans NaN)
+        dfi = df.index  # dates sans NaN
 
         out_alpha, out_beta, out_r2, out_tstat, out_resid, out_dates = [], [], [], [], [], []
 
@@ -161,7 +158,6 @@ def build_master_dataframe(
             "tstat": out_tstat, "resid": out_resid
         }, index=pd.Index(out_dates, name="Date"))
 
-        # écrit directement aligné sur l'index `master`
         master.loc[rr.index, f"{prefix}_alpha_w{w}"] = rr["alpha"]
         master.loc[rr.index, f"{prefix}_beta_w{w}"]  = rr["beta"]
         master.loc[rr.index, f"{prefix}_r2_w{w}"]    = rr["r2"]
@@ -223,7 +219,7 @@ def plot_rr_timeseries(master, kind, driver, window, title_prefix):
 
 def plot_scatter_beta_year_heat(master, kind, driver, window, x_on, r2_min=None, title=None, x_label=None):
     """
-    Scatter Beta vs NIVEAU (x_on = "SPREAD_bps" ou "CURVE_bps"), coloré par année (style heatmap que tu veux).
+    Scatter Beta vs NIVEAU (x_on = "SPREAD_bps" ou "CURVE_bps"), coloré par année (style heatmap).
       - `kind`   ∈ {"lvl","chg"}   (d'où vient Beta)
       - `driver` ∈ {"spread","curve"} (quelle OLS a produit Beta)
       - `window` int
@@ -275,7 +271,7 @@ def plot_box_level(master, title_suffix=""):
 
 
 # =========================
-# 3) BACKTEST — 100% basé sur `master` (fenêtre = ROLLING_WINDOW_DAYS)
+# 3) BACKTEST — basé 100% sur master
 # =========================
 def _first_cross(delta_series, tp, sl, side):
     """
@@ -305,17 +301,17 @@ def backtest_from_master(
     driver=DRIVER_FOR_SIGNAL
 ):
     """
-    Backtest qui réutilise les Alpha/Beta/R² de la RR niveaux (fenêtre = ROLLING_WINDOW_DAYS).
-      - t0 = dates où les colonnes RR (alpha/beta/r2) existent (fin de fenêtre TRAIN).
-      - entry = t = t0[ i + OBS_WINDOW_DAYS ]  (on reste SUR l'index dispo).
-      - epsilon_t = BOX_t - (Alpha(t0) + Beta(t0)*X_t), avec X_t = SPREAD_bps ou CURVE_bps à l’entrée.
+    Backtest qui réutilise Alpha/Beta/R² de la RR niveaux (fenêtre = ROLLING_WINDOW_DAYS).
+      - t0 = dates où RR (alpha/beta/r2) existent (fin de fenêtre TRAIN).
+      - entry = rr_dates[i + OBS_WINDOW_DAYS]  (déplacement **dans rr_dates**, donc dates valides uniquement).
+      - epsilon_t = BOX_t - (Alpha(t0) + Beta(t0)*X_t), X_t = SPREAD_bps ou CURVE_bps à l’entrée.
       - entrée si |epsilon|>=seuil ET R²(t0)>=r2_entry_threshold.
       - sortie via TP/SL/TIME sur les `holding_days` obs suivantes.
       - PnL = -side*(ExitBox - EntryBox)*dv01_k  (side=+1 LONG gagne si BOX ↓)
 
     Retour:
-      - trades_df  (trié par Entry; cumuls "by entry" + "by exit")
-      - pnl_tracker (time-series MtM: colonnes Trade_i + CumPnL)
+      - trades_df  (trié par Entry; cumuls “by entry” + “by exit”)
+      - pnl_tracker (time-series MtM: colonnes Trade_i + CumPnL) — **sans NaN**.
     """
     d = driver.upper()  # "SPREAD" / "CURVE"
     w = int(ROLLING_WINDOW_DAYS)
@@ -332,48 +328,50 @@ def backtest_from_master(
             raise KeyError(f"[backtest_from_master] Colonne manquante: {c}")
 
     idx = master.index
-    # t0 = dates où alpha/beta/r2 sont présents (donc fin de fenêtre TRAIN)
+
+    # t0 = dates où alpha/beta/r2 existent (donc fin de fenêtre TRAIN)
     valid_mask = master[[alpha_col, beta_col, r2_col]].notna().all(axis=1)
-    rr_dates = master.index[valid_mask]
+    rr_dates = master.index[valid_mask].sort_values()
     if len(rr_dates) == 0:
         return pd.DataFrame(), pd.DataFrame()
 
     trades = []
 
     # Boucle sur les fins de fenêtres (triées naturellement)
-    rr_dates = rr_dates.sort_values()
+    # >>> IMPORTANT: entry = rr_dates[i + obs_window_days] (déplacement dans rr_dates)
     for i in range(0, len(rr_dates) - obs_window_days):
         t0 = rr_dates[i]
-        entry_pos = idx.get_indexer([t0])[0] + obs_window_days
-        if entry_pos < 0 or entry_pos >= len(idx):
-            continue
-        entry_date = idx[entry_pos]
+        entry_date = rr_dates[i + obs_window_days]
 
         # Lire niveaux à l'entrée
-        x_t = master.iloc[entry_pos][x_col]
-        y_t = master.iloc[entry_pos][y_col]
+        if entry_date not in idx:
+            continue
+        x_t = master.at[entry_date, x_col]
+        y_t = master.at[entry_date, y_col]
         if pd.isna(x_t) or pd.isna(y_t):
             continue
 
         # Paramètres "gelés" au t0
-        alpha_t0 = master.loc[t0, alpha_col]
-        beta_t0  = master.loc[t0, beta_col]
-        r2_t0    = master.loc[t0, r2_col]
+        alpha_t0 = master.at[t0, alpha_col]
+        beta_t0  = master.at[t0, beta_col]
+        r2_t0    = master.at[t0, r2_col]
         if pd.isna(alpha_t0) or pd.isna(beta_t0) or pd.isna(r2_t0):
             continue
 
         # Résiduel + filtre
-        y_hat_t = alpha_t0 + beta_t0 * x_t
-        resid_t = y_t - y_hat_t
+        y_hat_t = float(alpha_t0) + float(beta_t0) * float(x_t)
+        resid_t = float(y_t) - y_hat_t
         if (abs(resid_t) < float(resid_threshold)) or (float(r2_t0) < float(r2_entry_threshold)):
             continue
 
         side = +1 if resid_t > 0 else -1
         entry_box = float(y_t)
 
-        # Trajectoire future (entry; entry+holding]
+        # Fenêtre (entry; entry+holding] — sur l'index complet dispo
+        entry_pos = idx.get_loc(entry_date)
         exit_pos_lim = min(entry_pos + holding_days, len(idx) - 1)
-        path = master.iloc[entry_pos+1: exit_pos_lim+1][y_col]
+        path = master.iloc[entry_pos+1: exit_pos_lim+1][y_col].dropna()
+
         if len(path) == 0:
             exit_date = entry_date
             exit_box  = entry_box
@@ -383,7 +381,7 @@ def backtest_from_master(
             tp = float(tp_mult) * float(resid_threshold)
             sl = float(sl_mult) * float(resid_threshold)
             exit_date, reason = _first_cross(delta, tp, sl, side)
-            exit_box = float(master.loc[exit_date, y_col])
+            exit_box = float(master.at[exit_date, y_col])
 
         pnl = -side * (exit_box - entry_box) * float(dv01_k)
 
@@ -408,38 +406,44 @@ def backtest_from_master(
     # (A) Tri par Entry (et Exit pour stabiliser si égalité)
     trades_df = trades_df.sort_values(["Entry", "Exit"]).reset_index(drop=True)
 
-    # (B) Cumuls “by entry” et “by exit” sans casser l’ordre par Entry
+    # (B) Cumuls “by entry” et “by exit” (on garde l'ordre par Entry dans le DataFrame)
     trades_df["RealizedCumPnL_by_entry"] = trades_df["PnL"].cumsum()
-
     exit_order = trades_df.sort_values("Exit").index
     cum_by_exit = trades_df.loc[exit_order, "PnL"].cumsum().values
     trades_df["RealizedCumPnL_by_exit"] = np.nan
     trades_df.loc[exit_order, "RealizedCumPnL_by_exit"] = cum_by_exit
 
-    # (C) PnL tracker (MtM), aligné uniquement sur les dates dispo
+    # (C) PnL tracker (MtM) — **sans NaN**, index = toutes les dates du portefeuille
     start_all = trades_df["Entry"].min()
     end_all   = trades_df["Exit"].max()
     dates = master.loc[(master.index >= start_all) & (master.index <= end_all)].index
     pnl_tracker = pd.DataFrame(index=dates)
 
+    # numéroter selon l'ordre d'entrée
     for i, row in trades_df.iterrows():
         entry = row["Entry"]; exit_ = row["Exit"]
         side  = +1 if row["Side"] == "LONG_BOX" else -1
-        entry_box = row["EntryBox"]
+        entry_box = float(row["EntryBox"])
 
-        ser = pd.Series(0.0, index=dates)  # 0 le jour d'entrée
-        in_window = (ser.index > entry) & (ser.index <= exit_)
-        if in_window.any():
-            box_slice = master.loc[in_window, y_col]
-            ser.loc[in_window] = -side * (box_slice - entry_box) * float(dv01_k)
-        # valeur figée après sortie
-        after_exit = ser.index > exit_
-        if after_exit.any():
-            value_at_exit = ser.loc[ser.index == exit_].iloc[0] if (ser.index == exit_).any() else 0.0
-            ser.loc[after_exit] = value_at_exit
+        # MtM = 0 le jour d'entrée; MtM = -side*(BOX - entry_box)*DV01_K sur (entry; exit]
+        path = master.loc[(master.index > entry) & (master.index <= exit_), y_col].dropna()
+        mtm = -side * (path - entry_box) * float(dv01_k)   # peut être vide si exit==entry
 
-        pnl_tracker[f"Trade_{i+1}"] = ser
+        # Série pleine sur tout l'horizon portefeuille
+        ser = pd.Series(0.0, index=dates, dtype=float)
+        if len(mtm) > 0:
+            ser.loc[mtm.index] = mtm.values
+            last_val = float(mtm.iloc[-1])
+        else:
+            last_val = 0.0
 
+        # lock après exit
+        ser.loc[ser.index > exit_] = last_val
+
+        # (important) rester 0.0 avant et au jour d’entrée (déjà le cas)
+        pnl_tracker[f"Trade_{i+1:03d}"] = ser
+
+    pnl_tracker = pnl_tracker.fillna(0.0)  # sécurité
     pnl_tracker["CumPnL"] = pnl_tracker.sum(axis=1)
 
     return trades_df, pnl_tracker
@@ -482,41 +486,31 @@ def plot_portfolio_pnl(pnl_tracker, title="Portfolio PnL (mark-to-market)"):
 #     window=ROLLING_WINDOW_DAYS
 # )
 
-# # 1) ANALYSE — NIVEAUX (BOX~SPREAD et BOX~CURVE), window = ROLLING_WINDOW_DAYS
+# # 1) ANALYSE — NIVEAUX (BOX~SPREAD et BOX~CURVE)
 # plot_rr_timeseries(master, "lvl", "spread", ROLLING_WINDOW_DAYS,
 #     f"BOX vs SPREAD (Levels) — {COUNTRY_HIGH}-{COUNTRY_LOW} | {MATU_SHORT}s{MATU_LONG}")
 # plot_rr_timeseries(master, "lvl", "curve",  ROLLING_WINDOW_DAYS,
 #     f"BOX vs CURVE  (Levels) — {BENCHMARK_CURVE_COUNTRY} {MATU_SHORT}s{MATU_LONG}")
-
 # # Scatter (levels): Beta vs niveaux SPREAD/CURVE (non filtré puis filtré par R²)
 # plot_scatter_beta_year_heat(master, "lvl", "spread", ROLLING_WINDOW_DAYS,
-#     x_on="SPREAD_bps",
-#     r2_min=None,
-#     title="Beta (Levels: BOX~SPREAD) vs SPREAD level — ALL",
-#     x_label="Spread Level (bps)")
+#     x_on="SPREAD_bps", r2_min=None,
+#     title="Beta (Levels: BOX~SPREAD) vs SPREAD level — ALL", x_label="Spread Level (bps)")
 # plot_scatter_beta_year_heat(master, "lvl", "spread", ROLLING_WINDOW_DAYS,
-#     x_on="SPREAD_bps",
-#     r2_min=R2_ENTRY_THRESHOLD,
-#     title=f"Beta (Levels: BOX~SPREAD) vs SPREAD level — R²≥{R2_ENTRY_THRESHOLD}",
-#     x_label="Spread Level (bps)")
+#     x_on="SPREAD_bps", r2_min=R2_ENTRY_THRESHOLD,
+#     title=f"Beta (Levels: BOX~SPREAD) vs SPREAD level — R²≥{R2_ENTRY_THRESHOLD}", x_label="Spread Level (bps)")
 
 # # 2) ANALYSE — DAILY CHANGES (ΔBOX~ΔSPREAD & ΔBOX~ΔCURVE)
 # plot_rr_timeseries(master, "chg", "spread", ROLLING_WINDOW_DAYS,
 #     f"ΔBOX vs ΔSPREAD (Daily Changes) — {COUNTRY_HIGH}-{COUNTRY_LOW} | {MATU_SHORT}s{MATU_LONG}")
 # plot_rr_timeseries(master, "chg", "curve",  ROLLING_WINDOW_DAYS,
 #     f"ΔBOX vs ΔCURVE  (Daily Changes) — {BENCHMARK_CURVE_COUNTRY} {MATU_SHORT}s{MATU_LONG}")
-
 # # Scatter demandé (daily changes): Beta(chg) vs **NIVEAU** du SPREAD (style heatmap par année)
 # plot_scatter_beta_year_heat(master, "chg", "spread", ROLLING_WINDOW_DAYS,
-#     x_on="SPREAD_bps",
-#     r2_min=None,
-#     title="Beta (ΔBOX~ΔSPREAD) vs SPREAD level — ALL",
-#     x_label="Spread Level (bps)")
+#     x_on="SPREAD_bps", r2_min=None,
+#     title="Beta (ΔBOX~ΔSPREAD) vs SPREAD level — ALL", x_label="Spread Level (bps)")
 # plot_scatter_beta_year_heat(master, "chg", "spread", ROLLING_WINDOW_DAYS,
-#     x_on="SPREAD_bps",
-#     r2_min=R2_ENTRY_THRESHOLD,
-#     title=f"Beta (ΔBOX~ΔSPREAD) vs SPREAD level — R²≥{R2_ENTRY_THRESHOLD}",
-#     x_label="Spread Level (bps)")
+#     x_on="SPREAD_bps", r2_min=R2_ENTRY_THRESHOLD,
+#     title=f"Beta (ΔBOX~ΔSPREAD) vs SPREAD level — R²≥{R2_ENTRY_THRESHOLD}", x_label="Spread Level (bps)")
 
 # # 3) Plot simple BOX
 # plot_box_level(master, title_suffix=f"— {COUNTRY_HIGH}-{COUNTRY_LOW} {MATU_SHORT}s{MATU_LONG}")
@@ -539,3 +533,4 @@ def plot_portfolio_pnl(pnl_tracker, title="Portfolio PnL (mark-to-market)"):
 #     title=f"Realized Cumulative PnL (by Exit) — {COUNTRY_HIGH}-{COUNTRY_LOW} {MATU_SHORT}s{MATU_LONG} [{DRIVER_FOR_SIGNAL}]")
 # plot_portfolio_pnl(pnl_tracker,
 #     title=f"Portfolio MtM PnL — {COUNTRY_HIGH}-{COUNTRY_LOW} {MATU_SHORT}s{MATU_LONG} [{DRIVER_FOR_SIGNAL}]")
+
