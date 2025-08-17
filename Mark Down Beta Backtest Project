@@ -1,0 +1,110 @@
+# Explications très détaillées (backtest)
+
+## Variables clés (toutes en jours)
+
+- **TRAIN_WINDOW_DAYS (par défaut 126)** : longueur de la fenêtre d’entraînement de la régression.  
+- **OBS_WINDOW_DAYS (21)** : période d’observation entre la fin du training et la date de décision *t*.  
+  → à la date *t*, le modèle a été entraîné sur `[t−(OBS+TRAIN), t−OBS)` (donc on laisse 1 mois de “cooldown”).  
+- **HOLDING_DAYS (21)** : durée maximale de détention d’un trade.  
+- **RESID_THRESHOLD** : seuil absolu |ϵₜ| pour déclencher l’entrée.  
+- **R2_ENTRY_THRESHOLD** : filtre (ex. 0.3) → on n’entre que si R² du modèle d’entraînement est au-dessus.  
+- **TP_MULT, SL_MULT** : niveaux TP et SL en multiples du seuil (ex: 0.5×threshold).  
+- **DV01_K** : notionnel de PnL (10 → 10k€).  
+- **DRIVER_FOR_SIGNAL** : `"SPREAD"` ou `"CURVE"` comme variable explicative *Xₜ*.  
+
+---
+
+## Stratégie (pas-à-pas)
+
+### Fenêtre d’entraînement à chaque date *t* :
+- Intervalle : `[t−OBS−TRAIN, t−OBS)` (purement passé).  
+- OLS sur `B = α + βX + ε` avec `X = driver` (spread/curve).  
+- On récupère **α̂, β̂, R²**.  
+
+### Signal à *t* :
+- `B̂ₜ = α̂ + β̂ Xₜ`  
+- Résiduel : `ϵₜ = Bₜ − B̂ₜ`  
+
+### Règle d’entrée :
+- Si `|ϵₜ| ≥ RESID_THRESHOLD` et `R² ≥ R2_ENTRY_THRESHOLD`  
+  → on ouvre **au plus un trade** ce jour *t* :  
+  - `ϵₜ > 0` ⇒ **LONG BOX** (on joue un flatten ⇒ on gagne si la box baisse)  
+  - `ϵₜ < 0` ⇒ **SHORT BOX** (on joue un steepen ⇒ on gagne si la box monte)  
+
+---
+
+## Gestion de la position (sur *(t, t+HOLDING]*)
+
+On calcule :  
+`ΔB_d = B_d − B_entry` pour chaque jour *d* après l’entrée.  
+
+- **LONG BOX (side=+1)** :  
+  - TP si ΔB ≤ −TP  
+  - SL si ΔB ≥ SL  
+
+- **SHORT BOX (side=−1)** :  
+  - TP si ΔB ≥ TP  
+  - SL si ΔB ≤ −SL  
+
+Sinon, sortie à la dernière date (raison = TIME).  
+→ Cette logique est implémentée par `_first_cross(...)`.
+
+---
+
+## PnL réalisé
+
+Formule :  
+`PnL = −side × (B_exit − B_entry) × DV01_K`
+
+- **LONG BOX** ⇒ profite d’une baisse de *B*  
+- **SHORT BOX** ⇒ profite d’une hausse de *B*  
+
+---
+
+## Tracking des positions & du PnL
+
+### Table `trades_df`
+Un trade par ligne, avec :  
+- entrée/sortie,  
+- niveau d’entrée, prédiction B̂ₜ, résiduel, β, R²,  
+- raison de sortie (TP/SL/TIME),  
+- PnL réalisé.  
+
+On ajoute `RealizedCumPnL = cumsum(PnL)` classé par date de sortie (logique réalisé).
+
+### Table `pnl_tracker` (time-series complète)
+- **Index** : toutes les dates de la 1ère entrée à la dernière sortie.  
+- **Colonnes** : Trade_1, Trade_2, …, Trade_N + CumPnL.  
+
+Pour chaque trade *i* :  
+- valeur 0 avant et le jour d’entrée,  
+- mark-to-market chaque jour entre (entrée; sortie] :  
+  `−side × (B_jour − B_entry) × DV01_K`  
+- après la sortie, la colonne reste constante au PnL réalisé (valeur figée/lockée).  
+
+`CumPnL = somme ligne par ligne sur toutes les colonnes Trade_i`.  
+→ Ce graphe montre l’évolution quotidienne du PnL global du portefeuille (positions ouvertes + positions fermées).
+
+---
+
+## Pourquoi pas de MIN_TRAIN_OBS ?
+Tu veux toujours 126 jours de training.  
+→ donc on skippe toute date *t* pour laquelle la fenêtre n’a pas au moins 126 obs valides.  
+Si tes données sont propres, ce cas ne se produit pas.
+
+---
+
+## Ce que tu peux changer en 1 ligne
+- Pays/maturités/benchmark : bloc Paramètres.  
+- Driver du signal (`DRIVER_FOR_SIGNAL`) : `"SPREAD"` ↔ `"CURVE"`.  
+- Fenêtres (jours) : `TRAIN_WINDOW_DAYS`, `OBS_WINDOW_DAYS`, `HOLDING_DAYS`.  
+- Seuils : `RESID_THRESHOLD`, `R2_ENTRY_THRESHOLD`, `TP_MULT`, `SL_MULT`.  
+- Notionnel : `DV01_K`.  
+
+
+
+
+
+
+
+
