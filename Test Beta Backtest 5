@@ -8,39 +8,40 @@ import matplotlib.cm as cm
 import matplotlib.dates as mdates
 from matplotlib.colors import Normalize
 import statsmodels.api as sm
-from typing import Optional
 
 # =========================
-# Paramètres (modifie ici)
+# Paramètres généraux (modifie ici)
 # =========================
-COUNTRY_HIGH  = "Italy"
-COUNTRY_LOW   = "Germany"
+COUNTRY_HIGH  = "Italy"         # pays avec le plus haut yield long (ex: Italy)
+COUNTRY_LOW   = "Germany"       # benchmark du spread (ex: Germany)
 BENCHMARK_CURVE_COUNTRY = "Germany"
 
-MATU_LONG  = "10Y"
-MATU_SHORT = "5Y"
-MATU_SPREAD = "10Y"     # maturité du SPREAD pour OLS/backtest
+MATU_LONG  = "10Y"              # maturité longue (ex: 10Y)
+MATU_SHORT = "5Y"               # maturité courte (ex: 5Y)
+MATU_SPREAD = "10Y"             # maturité du spread pour la régression (ex: 10Y)
 
-# Une SEULE fenêtre pour analyse + backtest (en nb d'observations)
-WINDOW_DAYS       = 126   # 63 / 126 / 252
-OBS_WINDOW_DAYS   = 21    # 21 / 42 / 63 / 126
-HOLDING_DAYS      = 21    # 21 / 42 / 63 / 126
+# >> Fenêtre unique pour analyse & backtest (en NOMBRE D'OBSERVATIONS)
+WINDOW_DAYS = 126               # 3/6/12 mois = 63/126/252, ici 126 par défaut
+
+# Périodes strat (toujours en nombre d'obs, i.e. jours ouvrés)
+OBS_WINDOW_DAYS = 21            # cooldown entre fin training et jour d’entrée
+HOLDING_DAYS    = 21            # max de détention
 
 # Seuils & notionnel
-RESID_THRESHOLD     = 2.0
-R2_ENTRY_THRESHOLD  = 0.30
-TP_MULT             = 0.5
-SL_MULT             = 0.5
-DV01_K              = 10.0   # 10 => 10 k€
+RESID_THRESHOLD     = 2.0       # |epsilon| pour déclencher un trade
+R2_ENTRY_THRESHOLD  = 0.30      # filtre R² minimum pour backtest
+TP_MULT             = 0.5       # TP = 0.5 * threshold (en pts de BOX)
+SL_MULT             = 0.5       # SL = 0.5 * threshold
+DV01_K              = 10.0      # 10 => 10k€ de DV01 notionnel
 
-# Driver pour la stratégie (sur NIVEAUX)
-DRIVER_FOR_SIGNAL = "SPREAD"  # "SPREAD" ou "CURVE"
+# Driver utilisé pour le backtest (sur niveaux)
+DRIVER_FOR_SIGNAL   = "SPREAD"  # "SPREAD" ou "CURVE"
 
-# R² pour filtrer les scatter (indépendant du backtest)
-SCATTER_R2_FILTER = 0.00
+# Filtre R² pour les scatters (indépendant de celui du backtest)
+SCATTER_R2_FILTER = 0.30
 
 # =========================
-# Helpers colonnes & coercion
+# Helpers noms colonnes
 # =========================
 def _safe_name(x: str) -> str:
     return x.replace(" ", "_")
@@ -51,29 +52,8 @@ def _col(country: str, matu: str) -> str:
 def _col_bps(country: str, matu: str) -> str:
     return f"{_safe_name(country)}_{matu}_bps"
 
-def _to_float_bps_series(s: pd.Series) -> pd.Series:
-    """Coerce -> float (errors='coerce'), puis convertit en bps (inputs en %)."""
-    return pd.to_numeric(s, errors="coerce").astype(float) * 100.0
-
-def _scalar_num(x) -> Optional[float]:
-    """
-    Coercition SCALAIRE ultra sûre:
-      - retourne None si x est None/NaN/inf invalide
-      - sinon float(x)
-    """
-    if x is None:
-        return None
-    try:
-        val = float(x)
-    except Exception:
-        return None
-    # gérer NaN/inf
-    if not np.isfinite(val):
-        return None
-    return val
-
 # =========================
-# 1) MASTER centralisé (tout en bps)
+# 1) MASTER DATAFRAME centralisée
 # =========================
 def build_master_dataframe(
     data: pd.DataFrame,
@@ -86,18 +66,17 @@ def build_master_dataframe(
     window_days: int = WINDOW_DAYS
 ) -> pd.DataFrame:
     """
-    Construit `master` (index=trading days) avec:
-      - 4 jambes de la BOX en bps (inputs en % -> *100 après coercion)
-      - BOX_bps, SPREAD_bps, CURVE_bps + leurs daily changes
-      - Rolling OLS (fenêtre `window_days`) pour:
-           * NIVEAUX :   BOX ~ SPREAD (lvl_spread_*)
-                         BOX ~ CURVE  (lvl_curve_*)
-           * DAILY Δ :  dBOX ~ dSPREAD (chg_spread_*)
-                        dBOX ~ dCURVE  (chg_curve_*)
-        Colonnes écrites : _alpha/_beta/_r2/_tstat/_resid (alignées fin de fenêtre).
+    Construit un DataFrame `master` UNIQUE qui contient en **bps**:
+      - jambe 10Y/5Y des deux pays (utiles pour BOX),
+      - BOX_bps, SPREAD_bps, CURVE_bps + leurs daily changes,
+      - Résultats rolling OLS pour cette **seule fenêtre** `window_days`:
+          * NIVEAUX : BOX ~ SPREAD, BOX ~ CURVE
+          * DAILY   : ΔBOX ~ ΔSPREAD, ΔBOX ~ ΔCURVE
+      - Colonnes: <kind>_(spread|curve)_(alpha|beta|r2|tstat|resid)_w{window_days}
     """
     master = pd.DataFrame(index=pd.to_datetime(data.index)).sort_index()
 
+    # Vérifs colonnes nécessaires
     cols_needed = [
         _col(country_high, matu_long),
         _col(country_low,  matu_long),
@@ -110,94 +89,84 @@ def build_master_dataframe(
     ]
     missing = [c for c in cols_needed if c not in data.columns]
     if missing:
-        raise KeyError(f"[build_master_dataframe] Colonnes manquantes: {missing}")
+        raise KeyError(f"Colonnes manquantes dans `data`: {missing}")
 
-    # === 4 jambes en bps (coercion AVANT toute opération arithmétique)
-    high_long_bps  = _to_float_bps_series(data[_col(country_high, matu_long)])
-    low_long_bps   = _to_float_bps_series(data[_col(country_low,  matu_long)])
-    high_short_bps = _to_float_bps_series(data[_col(country_high, matu_short)])
-    low_short_bps  = _to_float_bps_series(data[_col(country_low,  matu_short)])
+    # Taux (en %) -> bps (*100)
+    master[_col_bps(country_high, matu_long)]  = data[_col(country_high, matu_long)].astype(float) * 100.0
+    master[_col_bps(country_low,  matu_long)]  = data[_col(country_low,  matu_long)].astype(float) * 100.0
+    master[_col_bps(country_high, matu_short)] = data[_col(country_high, matu_short)].astype(float) * 100.0
+    master[_col_bps(country_low,  matu_short)] = data[_col(country_low,  matu_short)].astype(float) * 100.0
 
-    master[_col_bps(country_high, matu_long)]  = high_long_bps
-    master[_col_bps(country_low,  matu_long)]  = low_long_bps
-    master[_col_bps(country_high, matu_short)] = high_short_bps
-    master[_col_bps(country_low,  matu_short)] = low_short_bps
+    # Séries dérivées (bps)
+    master["BOX_bps"] = (
+        master[_col_bps(country_high, matu_long)] - master[_col_bps(country_low,  matu_long)]
+        - (master[_col_bps(country_high, matu_short)] - master[_col_bps(country_low,  matu_short)])
+    )
+    master["SPREAD_bps"] = (data[_col(country_high, matu_spread)].astype(float)
+                            - data[_col(country_low, matu_spread)].astype(float)) * 100.0
+    master["CURVE_bps"]  = (data[_col(curve_country, matu_long)].astype(float)
+                            - data[_col(curve_country, matu_short)].astype(float)) * 100.0
 
-    # === Séries dérivées (toutes en bps)
-    # BOX = (High_long - Low_long) - (High_short - Low_short)
-    master["BOX_bps"] = (high_long_bps - low_long_bps) - (high_short_bps - low_short_bps)
-
-    # SPREAD = High(matu_spread) - Low(matu_spread)  (coercion jambe par jambe)
-    spread_high_bps = _to_float_bps_series(data[_col(country_high, matu_spread)])
-    spread_low_bps  = _to_float_bps_series(data[_col(country_low,  matu_spread)])
-    master["SPREAD_bps"] = spread_high_bps - spread_low_bps
-
-    # CURVE (bench) = curve_country long - short (coercion jambe par jambe)
-    curve_long_bps  = _to_float_bps_series(data[_col(curve_country, matu_long)])
-    curve_short_bps = _to_float_bps_series(data[_col(curve_country, matu_short)])
-    master["CURVE_bps"]  = curve_long_bps - curve_short_bps
-
-    # Daily changes (bps)
+    # Daily changes
     master["dBOX_bps"]    = master["BOX_bps"].diff()
     master["dSPREAD_bps"] = master["SPREAD_bps"].diff()
     master["dCURVE_bps"]  = master["CURVE_bps"].diff()
 
-    # === Rolling OLS writer (fenêtre = window_days)
-    def _rolling_ols_write(ycol: str, xcol: str, window: int, prefix: str) -> None:
-        # Colonnes vides au préalable
+    # Rolling OLS writer
+    def _rolling_ols_write(ycol, xcol, window, prefix):
+        y = master[ycol]; x = master[xcol]
+        df = pd.concat([y.rename("y"), x.rename("x")], axis=1).dropna()
+        # cols init à NaN
         for suff in ["alpha","beta","r2","tstat","resid"]:
             master[f"{prefix}_{suff}_w{window}"] = np.nan
-
-        df = pd.concat([master[ycol].rename("y"), master[xcol].rename("x")], axis=1).dropna()
         if len(df) < window:
             return
-
-        alpha_l, beta_l, r2_l, tstat_l, resid_l, idx_out = [], [], [], [], [], []
-        yv, xv, di = df["y"].values.astype(float), df["x"].values.astype(float), df.index
-
+        idx_out, alpha_l, beta_l, r2_l, t_l, resid_l = [], [], [], [], [], []
+        yv, xv, dfi = df["y"].values, df["x"].values, df.index
         for end in range(window, len(df)+1):
             start = end - window
-            y_w = yv[start:end]; x_w = xv[start:end]
-            X = sm.add_constant(x_w, has_constant="add")
-            res = sm.OLS(y_w, X).fit()
-
-            last_y, last_x = y_w[-1], x_w[-1]
-            yhat_last = res.params[0] + res.params[1]*last_x
-
-            idx_out.append(di[end-1])
+            yy, xx = yv[start:end], xv[start:end]
+            X = sm.add_constant(xx, has_constant='add')
+            res = sm.OLS(yy, X).fit()
+            yhat_last = res.params[0] + res.params[1]*xx[-1]
+            idx_out.append(dfi[end-1])
             alpha_l.append(float(res.params[0]))
             beta_l.append(float(res.params[1]))
             r2_l.append(float(res.rsquared))
-            tstat_l.append(float(res.tvalues[1]))
-            resid_l.append(float(last_y - yhat_last))
-
-        rr = pd.DataFrame(
-            {"alpha": alpha_l, "beta": beta_l, "r2": r2_l, "tstat": tstat_l, "resid": resid_l},
-            index=pd.Index(idx_out, name="Date")
-        )
-        for suff in ["alpha","beta","r2","tstat","resid"]:
-            master[f"{prefix}_{suff}_w{window}"] = rr[suff].reindex(master.index).astype(float)
+            t_l.append(float(res.tvalues[1]))
+            resid_l.append(float(yy[-1] - yhat_last))
+        rr = pd.DataFrame({
+            "alpha": alpha_l, "beta": beta_l, "r2": r2_l, "tstat": t_l, "resid": resid_l
+        }, index=pd.Index(idx_out, name="Date"))
+        for name, col in rr.items():
+            master[f"{prefix}_{name}_w{window}"] = col.reindex(master.index)
 
     w = int(window_days)
     # NIVEAUX
-    _rolling_ols_write("BOX_bps", "SPREAD_bps", w, "lvl_spread")
-    _rolling_ols_write("BOX_bps", "CURVE_bps",  w, "lvl_curve")
-    # DAILY Δ
+    _rolling_ols_write("BOX_bps",  "SPREAD_bps", w, "lvl_spread")
+    _rolling_ols_write("BOX_bps",  "CURVE_bps",  w, "lvl_curve")
+    # DAILY CHANGES
     _rolling_ols_write("dBOX_bps", "dSPREAD_bps", w, "chg_spread")
     _rolling_ols_write("dBOX_bps", "dCURVE_bps",  w, "chg_curve")
 
     return master
 
 # =========================
-# 2) Plots (timeseries + scatter year-colored)
+# 2) PLOTS d'analyse (timeseries + scatter heatmap)
 # =========================
-def plot_rr_timeseries(master: pd.DataFrame, kind: str, driver: str, window: int, title_prefix: str) -> None:
+def plot_rr_timeseries(master: pd.DataFrame, kind: str, driver: str, window: int, title_prefix: str):
+    """
+    Affiche R², Beta, T-stat, Residual pour:
+      kind   ∈ {"lvl","chg"}
+      driver ∈ {"spread","curve"}
+      window = taille de fenêtre (ex: 63/126/252)
+    Colonnes lues: {kind}_{driver}_{metric}_w{window}.
+    """
     k = kind.lower(); d = driver.lower()
-    cols = [f"{k}_{d}_{m}_w{window}" for m in ["r2", "beta", "tstat", "resid"]]
-    missing = [c for c in cols if c not in master.columns]
-    if missing:
-        print(f"[plot_rr_timeseries] Manque: {missing}"); return
-
+    cols = [f"{k}_{d}_r2_w{window}", f"{k}_{d}_beta_w{window}",
+            f"{k}_{d}_tstat_w{window}", f"{k}_{d}_resid_w{window}"]
+    if any(c not in master.columns for c in cols):
+        print(f"[plot_rr_timeseries] Colonnes manquantes pour {k}/{d}/w{window}."); return
     df = master[cols].dropna(how="all")
     if df.empty:
         print("[plot_rr_timeseries] Rien à tracer."); return
@@ -216,60 +185,59 @@ def plot_rr_timeseries(master: pd.DataFrame, kind: str, driver: str, window: int
         plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
     plt.tight_layout(rect=[0, 0, 1, 0.95]); plt.show()
 
-def plot_scatter_beta_yearcolored(
-    master: pd.DataFrame,
-    kind: str, driver: str, window: int,
-    x_on: str,                       # "SPREAD_bps" ou "CURVE_bps"
-    r2_filter: Optional[float] = None,
-    title: Optional[str] = None,
-    x_label: Optional[str] = None
-) -> None:
-    """Scatter Beta vs niveau (X) coloré par année (coolwarm), filtre R² optionnel."""
+def plot_scatter_beta_yearcolored(master: pd.DataFrame, kind: str, driver: str, window: int,
+                                  x_on: str, r2_filter: float | None,
+                                  title: str, x_label: str):
+    """
+    Scatter 'heatmap' façon année (coolwarm):
+      - Y = Beta de la RR ({kind}_{driver}_beta_w{window})
+      - X = niveau (x_on ∈ {"SPREAD_bps","CURVE_bps"})
+      - Couleur = année (index.year)
+      - r2_filter = None (pas de filtre) ou float (garde seulement R² >= seuil)
+    """
     k = kind.lower(); d = driver.lower()
     beta_col = f"{k}_{d}_beta_w{window}"
     r2_col   = f"{k}_{d}_r2_w{window}"
-    need = [beta_col, x_on]
-    miss = [c for c in need if c not in master.columns]
-    if miss:
-        print(f"[plot_scatter_beta_yearcolored] Manque: {miss}"); return
+    if beta_col not in master.columns or x_on not in master.columns:
+        print("[plot_scatter_beta_yearcolored] colonnes manquantes."); return
 
-    df = master[[beta_col, x_on]].dropna()
+    df = master[[beta_col, r2_col, x_on]].dropna()
     if r2_filter is not None:
-        if r2_col not in master.columns:
-            print(f"[plot_scatter_beta_yearcolored] Manque: {r2_col}"); return
-        df = df.join(master[[r2_col]], how="inner").dropna()
         df = df[df[r2_col] >= float(r2_filter)]
-
     if df.empty:
-        print("[plot_scatter_beta_yearcolored] Rien à tracer."); return
+        print("[plot_scatter_beta_yearcolored] rien à tracer après filtre."); return
 
     years = df.index.year
-    cmap = cm.get_cmap("coolwarm")
-    norm = Normalize(vmin=years.min(), vmax=years.max())
+    cmap = cm.get_cmap("coolwarm"); norm = Normalize(vmin=years.min(), vmax=years.max())
 
-    plt.figure(figsize=(10, 6))
-    plt.scatter(df[x_on].astype(float), df[beta_col].astype(float), c=[cmap(norm(y)) for y in years])
+    plt.figure(figsize=(10,6))
+    plt.scatter(df[x_on].values, df[beta_col].values, c=[cmap(norm(y)) for y in years])
     cbar = plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap)); cbar.set_label("Year")
-    plt.xlabel(x_label or x_on); plt.ylabel("Beta")
-    plt.title(title or f"Beta ({k.upper()} vs {d.upper()}) — scatter vs {x_on}")
-    plt.grid(True); plt.show()
+    plt.xlabel(x_label); plt.ylabel("Beta")
+    plt.title(title); plt.grid(True); plt.show()
 
-def plot_box_level(master: pd.DataFrame, title_suffix: str = "") -> None:
+def plot_box_level(master: pd.DataFrame, title_suffix: str = ""):
+    """Trace BOX_bps vs temps (utile pour sanity check des niveaux)."""
     if "BOX_bps" not in master.columns:
         print("[plot_box_level] 'BOX_bps' absent."); return
-    plt.figure(figsize=(12, 5))
-    plt.plot(master.index, master["BOX_bps"].astype(float), linewidth=1.6, label="BOX (bps)")
+    plt.figure(figsize=(12,5))
+    plt.plot(master.index, master["BOX_bps"], linewidth=1.6, label="BOX (bps)")
     plt.title(f"BOX level over time {title_suffix}"); plt.xlabel("Date"); plt.ylabel("BOX (bps)")
     plt.grid(True, alpha=0.35)
     ax = plt.gca()
     ax.xaxis.set_major_locator(mdates.YearLocator()); ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
-    plt.setp(ax.get_xticklabels(), rotation=45, ha='right'); plt.tight_layout(); plt.legend(); plt.show()
+    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+    plt.tight_layout(); plt.legend(); plt.show()
 
 # =========================
-# 3) Backtest RR-index aware (entrée à RR_dates[i+L])
+# 3) BACKTEST (depuis master, en s’alignant sur les dates RR)
 # =========================
 def _first_cross(delta_series: pd.Series, tp: float, sl: float, side: int):
-    """Retourne (exit_date, 'TP'/'SL'/'TIME') selon 1er hit; LONG: Δ<=-TP, Δ>=+SL / SHORT: Δ>=+TP, Δ<=-SL."""
+    """
+    Renvoie (exit_date, reason) selon première atteinte TP/SL; sinon TIME au dernier point.
+    LONG (side=+1): TP si Δ<=-tp ; SL si Δ>=+sl
+    SHORT (side=-1): TP si Δ>=+tp ; SL si Δ<=-sl
+    """
     for dt, d in delta_series.items():
         if side == +1:
             if d <= -tp: return dt, "TP"
@@ -281,156 +249,165 @@ def _first_cross(delta_series: pd.Series, tp: float, sl: float, side: int):
 
 def backtest_from_master(
     master: pd.DataFrame,
-    window_days: int          = WINDOW_DAYS,      # match les colonnes lvl_*_w{window_days}
-    obs_window_days: int      = OBS_WINDOW_DAYS,  # L
-    holding_days: int         = HOLDING_DAYS,     # H
-    resid_threshold: float    = RESID_THRESHOLD,
-    r2_entry_threshold: float = R2_ENTRY_THRESHOLD,
-    tp_mult: float            = TP_MULT,
-    sl_mult: float            = SL_MULT,
-    dv01_k: float             = DV01_K,
-    driver: str               = DRIVER_FOR_SIGNAL # "SPREAD" ou "CURVE"
+    window_days: int         = WINDOW_DAYS,       # = fenêtre de la RR déjà calculée
+    obs_window_days: int     = OBS_WINDOW_DAYS,   # L
+    holding_days: int        = HOLDING_DAYS,      # H
+    resid_threshold: float   = RESID_THRESHOLD,
+    r2_entry_threshold: float= R2_ENTRY_THRESHOLD,
+    tp_mult: float           = TP_MULT,
+    sl_mult: float           = SL_MULT,
+    dv01_k: float            = DV01_K,
+    driver: str              = DRIVER_FOR_SIGNAL  # "SPREAD" ou "CURVE"
 ):
     """
-    Itère sur les dates OLS disponibles (RR_dates). Pour chaque i:
-      entry = RR_dates[i + L], params gelés = (alpha,beta,r2) à RR_dates[i].
-      epsilon = BOX(entry) - [alpha + beta * X(entry)].
-      Si |epsilon| >= threshold et r2 >= r2_entry_threshold => trade.
-      Sortie via TP/SL/TIME sur H obs suivantes (dans l’index `master`).
-      PnL (k€) = -side * (ExitBox - EntryBox) * dv01_k ; side=+1 LONG_BOX (gagne si BOX ↓).
+    Utilise les **Alpha/Beta/R² NIVEAUX** déjà stockés en w={window_days} et décide à t0[i+L] (index-based).
+    - Dates de décision = dates RR décalées de L obs (pas addition calendrier).
+    - epsilon_t = BOX_t - (alpha_t0 + beta_t0 * X_t) avec X=SPREAD_bps ou CURVE_bps.
+    - Entrée si |epsilon| >= resid_threshold et R²_t0 >= r2_entry_threshold.
+    - Sortie par TP/SL/TIME sur H obs suivantes.
+    - PnL = -side * (Exit - Entry) * dv01_k ; side=+1 (LONG_BOX) gagne si BOX baisse.
+    Sorties:
+      trades_df (TRIÉ PAR ENTRY) avec:
+         RealizedCumPnL_by_exit  (cumul réalisé, ordonné par dates de sortie, puis ramené à l’ordre d’entrée)
+         RealizedCumPnL_by_entry (cumul PnL trié par entrée)
+      pnl_tracker: time-series MtM (0 le jour d’entrée, MtM jusqu’à exit, puis valeur figée)
     """
     d = driver.lower()
-    a_col = f"lvl_{d}_alpha_w{window_days}"
-    b_col = f"lvl_{d}_beta_w{window_days}"
-    r_col = f"lvl_{d}_r2_w{window_days}"
-    x_col = f"{driver.upper()}_bps"
-    y_col = "BOX_bps"
+    alpha_col = f"lvl_{d}_alpha_w{window_days}"
+    beta_col  = f"lvl_{d}_beta_w{window_days}"
+    r2_col    = f"lvl_{d}_r2_w{window_days}"
+    x_col     = f"{driver.upper()}_bps"     # "SPREAD_bps" ou "CURVE_bps"
+    y_col     = "BOX_bps"
 
-    need = [a_col, b_col, r_col, x_col, y_col]
-    miss = [c for c in need if c not in master.columns]
-    if miss:
-        raise KeyError(f"[backtest_from_master] Manque: {miss}")
+    for c in [alpha_col, beta_col, r2_col, x_col, y_col]:
+        if c not in master.columns:
+            raise KeyError(f"[backtest_from_master] colonne manquante: {c}")
 
-    rr_mask  = master[[a_col, b_col, r_col]].notna().all(axis=1)
-    RR_dates = master.index[rr_mask]
-    if len(RR_dates) <= obs_window_days:
+    # Dates de fin de fenêtre où les params existent (RR) — triées
+    rr_mask = master[[alpha_col, beta_col, r2_col]].notna().all(axis=1)
+    rr_dates = master.index[rr_mask].tolist()
+    if len(rr_dates) == 0:
         return pd.DataFrame(), pd.DataFrame()
 
     idx = master.index
+
     trades = []
-    L = int(obs_window_days)
-    H = int(holding_days)
+    # i va de 0 à len(rr_dates) - 1 - L (car on regarde t0[i+L])
+    last_i = len(rr_dates) - 1 - obs_window_days
+    for i in range(max(0, last_i + 1)):
+        t0 = rr_dates[i]                # fin de train window
+        # position de t0 dans l’index global
+        pos0 = idx.get_indexer([t0])[0]
+        entry_pos = pos0 + obs_window_days
+        if entry_pos >= len(idx):
+            continue
+        entry_date = idx[entry_pos]
 
-    # ----- Boucle signaux : entry à RR_dates[i + L]
-    for i in range(0, len(RR_dates) - L):
-        t0         = RR_dates[i]
-        entry_date = RR_dates[i + L]
-
-        # Lire paramètres (scalaires sûrs)
-        alpha = _scalar_num(master.at[t0, a_col])
-        beta  = _scalar_num(master.at[t0, b_col])
-        r2    = _scalar_num(master.at[t0, r_col])
-        xt    = _scalar_num(master.at[entry_date, x_col])
-        yt    = _scalar_num(master.at[entry_date, y_col])
-
-        # Skip si un seul None/NaN
-        if (alpha is None) or (beta is None) or (r2 is None) or (xt is None) or (yt is None):
+        # Valeurs d'entrée
+        x_t = master.iloc[entry_pos][x_col]
+        y_t = master.iloc[entry_pos][y_col]
+        alpha_t0 = master.loc[t0, alpha_col]
+        beta_t0  = master.loc[t0, beta_col]
+        r2_t0    = master.loc[t0, r2_col]
+        if pd.isna(x_t) or pd.isna(y_t) or pd.isna(alpha_t0) or pd.isna(beta_t0) or pd.isna(r2_t0):
             continue
 
-        y_hat = alpha + beta * xt
-        resid = yt - y_hat
-        if (abs(resid) < float(resid_threshold)) or (r2 < float(r2_entry_threshold)):
+        # Décision
+        y_hat_t = alpha_t0 + beta_t0 * x_t
+        resid_t = y_t - y_hat_t
+        if (abs(resid_t) < resid_threshold) or (r2_t0 < r2_entry_threshold):
             continue
 
-        side = +1 if resid > 0 else -1
-        entry_box = yt
+        side = +1 if resid_t > 0 else -1
+        entry_box = float(y_t)
 
-        # Position dans l'index (par sécurité)
-        entry_pos = idx.get_indexer([entry_date])[0]
-        if entry_pos < 0:
-            continue
-        exit_pos  = min(entry_pos + H, len(idx) - 1)
-
-        # Trajectoire future (entry; exit]
-        path = master[y_col].iloc[entry_pos+1: exit_pos+1].astype(float)
+        # Trajectoire future: (entry; entry+H]
+        exit_pos = min(entry_pos + holding_days, len(idx) - 1)
+        path = master.iloc[entry_pos+1: exit_pos+1][y_col]
         if len(path) == 0:
-            exit_date = entry_date; exit_box = entry_box; reason = "TIME"
+            exit_date = entry_date
+            exit_box  = entry_box
+            reason    = "TIME"
         else:
             delta = path - entry_box
-            tp = float(tp_mult) * float(resid_threshold)
-            sl = float(sl_mult) * float(resid_threshold)
+            tp = tp_mult * resid_threshold
+            sl = sl_mult * resid_threshold
             exit_date, reason = _first_cross(delta, tp, sl, side)
-            exit_box = _scalar_num(master.at[exit_date, y_col])
-            if exit_box is None:
-                # si jamais None à la date de sortie, fallback = dernière valeur connue dans 'path'
-                exit_box = float(path.loc[:exit_date].iloc[-1])
+            exit_box = float(master.loc[exit_date, y_col])
 
-        pnl = -side * (exit_box - entry_box) * float(dv01_k)
+        pnl = -side * (exit_box - entry_box) * dv01_k
 
         trades.append({
             "Entry": entry_date,
             "Exit":  exit_date,
-            "Side":  "LONG_BOX" if side==+1 else "SHORT_BOX",
-            "EntryBox": float(entry_box),
-            "Predicted": float(y_hat),
-            "Residual":  float(resid),
-            "Beta": float(beta),
-            "R2":   float(r2),
-            "Reason": reason,
-            "ExitBox": float(exit_box),
-            "PnL": float(pnl)
+            "Side": "LONG_BOX" if side==+1 else "SHORT_BOX",
+            "EntryBox": entry_box,
+            "Predicted": float(y_hat_t),
+            "Residual":  float(resid_t),
+            "Beta":      float(beta_t0),
+            "R2":        float(r2_t0),
+            "Reason":    reason,
+            "ExitBox":   exit_box,
+            "PnL":       float(pnl)
         })
 
     trades_df = pd.DataFrame(trades)
     if trades_df.empty:
         return trades_df, pd.DataFrame()
 
-    # ----- PnL réalisé cumulé (par date de sortie)
-    trades_df = trades_df.sort_values("Exit").reset_index(drop=True)
-    trades_df["RealizedCumPnL"] = trades_df["PnL"].cumsum()
+    # --- Toujours trier par **date d'entrée** (demande utilisateur)
+    trades_df = trades_df.sort_values(["Entry", "Exit"]).reset_index(drop=True)
 
-    # ----- PnL tracker (MtM) ALIGNÉ sur les dates dispo (BOX non-NaN & non-None)
+    # Cumuls réalisés — deux versions:
+    # 1) Réalisé par date de SORTIE (classique), puis ramené à l'ordre Entry
+    temp = trades_df.reset_index().rename(columns={"index":"rowid"})
+    temp_exit = temp.sort_values("Exit").copy()
+    temp_exit["RealizedCumPnL_by_exit"] = temp_exit["PnL"].cumsum()
+    trades_df = temp.merge(
+        temp_exit[["rowid","RealizedCumPnL_by_exit"]], on="rowid", how="left"
+    ).drop(columns=["rowid"])
+    # 2) Cumul par **ordre d'entrée** (chronologique)
+    trades_df["RealizedCumPnL_by_entry"] = trades_df["PnL"].cumsum()
+
+    # --- PnL tracker (MtM)
     start_all = trades_df["Entry"].min()
     end_all   = trades_df["Exit"].max()
-    mask_dates = (master.index >= start_all) & (master.index <= end_all) & master[y_col].notna().values
-    dates = master.index[mask_dates]
-    box_path = master[y_col].reindex(dates).astype(float)  # trajectoire BOX sur la timeline PnL
-
+    dates = master.loc[(master.index >= start_all) & (master.index <= end_all)].index
     pnl_tracker = pd.DataFrame(index=dates, dtype=float)
 
     for i, row in trades_df.iterrows():
-        entry, exit_ = row["Entry"], row["Exit"]
-        side = +1 if row["Side"] == "LONG_BOX" else -1
-        entry_box = float(row["EntryBox"])
-        realized  = float(row["PnL"])
+        entry = row["Entry"]; exit_ = row["Exit"]
+        side  = +1 if row["Side"] == "LONG_BOX" else -1
+        entry_box = row["EntryBox"]
 
         ser = pd.Series(0.0, index=dates, dtype=float)  # 0 le jour d’entrée
+        in_window = (ser.index > entry) & (ser.index <= exit_)
+        if in_window.any():
+            # aligné strictement sur les dates existantes
+            box_slice = master.loc[in_window, y_col].astype(float)
+            ser.loc[in_window] = -side * (box_slice - entry_box) * dv01_k
 
-        # MtM uniquement entre (entry; exit]
-        win_idx = dates[(dates > entry) & (dates <= exit_)]
-        if len(win_idx) > 0:
-            vals = box_path.loc[win_idx]
-            ser.loc[vals.index] = -side * (vals - entry_box) * float(dv01_k)
-
-        # Après la sortie: valeur figée = PnL réalisé
-        after = dates > exit_
-        if after.any():
-            ser.loc[after] = realized
+        # fige la valeur après la sortie
+        if (ser.index > exit_).any():
+            last_val = ser.loc[ser.index == exit_]
+            if not last_val.empty:
+                ser.loc[ser.index > exit_] = float(last_val.iloc[0])
 
         pnl_tracker[f"Trade_{i+1}"] = ser
 
-    pnl_tracker["CumPnL"] = pnl_tracker.sum(axis=1)
+    # CumPnL = somme des colonnes Trade_*
+    pnl_tracker["CumPnL"] = pnl_tracker.filter(like="Trade_").sum(axis=1)
 
     return trades_df, pnl_tracker
 
 # =========================
-# 4) Plots PnL backtest
+# 4) PLOTS Backtest
 # =========================
-def plot_cum_pnl_realized(trades_df: pd.DataFrame, title="Realized Cumulative PnL (k€)"):
+def plot_cum_pnl_realized(trades_df: pd.DataFrame, title="Realized Cumulative PnL (k€) [by Exit]"):
     if trades_df.empty:
         print("Pas de trades générés."); return
     plt.figure(figsize=(12,5))
-    plt.plot(trades_df["Exit"], trades_df["RealizedCumPnL"])
+    plt.plot(trades_df["Exit"], trades_df["RealizedCumPnL_by_exit"])
     plt.title(title); plt.xlabel("Exit date"); plt.ylabel("Cum PnL (k€)")
     plt.grid(True); plt.show()
 
@@ -443,60 +420,74 @@ def plot_portfolio_pnl(pnl_tracker: pd.DataFrame, title="Portfolio PnL (mark-to-
     plt.grid(True); plt.show()
 
 # =========================
-# ==== EXEMPLES D’APPELS SÉPARÉS ====
+# ====== EXEMPLES D’APPELS (séparés) ======
 # =========================
 
-# # 0) MASTER une fois pour toutes (fenêtre unique pour analyse + backtest)
+# # 0) Construire le master une seule fois (fenêtre unique)
 # master = build_master_dataframe(
 #     data,
 #     COUNTRY_HIGH, COUNTRY_LOW, MATU_LONG, MATU_SHORT, MATU_SPREAD, BENCHMARK_CURVE_COUNTRY,
-#     window_days=WINDOW_DAYS
+#     window_days=WINDOW_DAYS            # <- unique window pour analyse & backtest
 # )
 
-# # 1) ANALYSE — NIVEAUX (BOX~SPREAD / BOX~CURVE) sur WINDOW_DAYS
-# plot_rr_timeseries(master, "lvl", "spread", WINDOW_DAYS,
-#     f"BOX vs SPREAD (Levels) — {COUNTRY_HIGH}-{COUNTRY_LOW} | {MATU_SHORT}s{MATU_LONG}")
-# plot_rr_timeseries(master, "lvl", "curve",  WINDOW_DAYS,
-#     f"BOX vs CURVE  (Levels) — {BENCHMARK_CURVE_COUNTRY} {MATU_SHORT}s{MATU_LONG}")
+# # 1) ANALYSE — NIVEAUX (BOX~SPREAD et BOX~CURVE) pour window=WINDOW_DAYS
+# plot_rr_timeseries(master, kind="lvl", driver="spread", window=WINDOW_DAYS,
+#     title_prefix=f"BOX vs SPREAD (Levels) — {COUNTRY_HIGH}-{COUNTRY_LOW} | {MATU_SHORT}s{MATU_LONG}")
+# plot_rr_timeseries(master, kind="lvl", driver="curve",  window=WINDOW_DAYS,
+#     title_prefix=f"BOX vs CURVE  (Levels) — {BENCHMARK_CURVE_COUNTRY} {MATU_SHORT}s{MATU_LONG}")
 
-# # 1bis) SCATTERS (coolwarm & filtre R² optionnel)
-# plot_scatter_beta_yearcolored(master, "lvl", "spread", WINDOW_DAYS,
+# # (Scatters niveaux si besoin)
+# plot_scatter_beta_yearcolored(master, kind="lvl", driver="spread", window=WINDOW_DAYS,
 #     x_on="SPREAD_bps", r2_filter=None,
-#     title="Beta (Levels: BOX~SPREAD) vs Spread Level — no R² filter",
+#     title="Beta (Levels: BOX~SPREAD) vs Spread LEVEL — no R² filter",
 #     x_label="Spread Level (bps)")
-# plot_scatter_beta_yearcolored(master, "lvl", "spread", WINDOW_DAYS,
+# plot_scatter_beta_yearcolored(master, kind="lvl", driver="spread", window=WINDOW_DAYS,
 #     x_on="SPREAD_bps", r2_filter=SCATTER_R2_FILTER,
-#     title=f"Beta (Levels: BOX~SPREAD) vs Spread Level — R² ≥ {SCATTER_R2_FILTER:.2f}",
+#     title=f"Beta (Levels: BOX~SPREAD) vs Spread LEVEL — R² ≥ {SCATTER_R2_FILTER:.2f}",
 #     x_label="Spread Level (bps)")
 
-# plot_scatter_beta_yearcolored(master, "lvl", "curve", WINDOW_DAYS,
+# # 2) ANALYSE — DAILY CHANGES (ΔBOX~ΔSPREAD / ΔBOX~ΔCURVE) pour window=WINDOW_DAYS
+# plot_rr_timeseries(master, kind="chg", driver="spread", window=WINDOW_DAYS,
+#     title_prefix=f"ΔBOX vs ΔSPREAD (Daily Changes) — {COUNTRY_HIGH}-{COUNTRY_LOW} | {MATU_SHORT}s{MATU_LONG}")
+# plot_rr_timeseries(master, kind="chg", driver="curve",  window=WINDOW_DAYS,
+#     title_prefix=f"ΔBOX vs ΔCURVE  (Daily Changes) — {BENCHMARK_CURVE_COUNTRY} {MATU_SHORT}s{MATU_LONG}")
+
+# # Scatters demandés: Beta(chg) vs **niveau** (SPREAD puis CURVE), heatmap color=Year
+# plot_scatter_beta_yearcolored(master, kind="chg", driver="spread", window=WINDOW_DAYS,
+#     x_on="SPREAD_bps", r2_filter=None,
+#     title="Beta (Daily Changes: ΔBOX~ΔSPREAD) vs Spread LEVEL — no R² filter",
+#     x_label="Spread Level (bps)")
+# plot_scatter_beta_yearcolored(master, kind="chg", driver="spread", window=WINDOW_DAYS,
+#     x_on="SPREAD_bps", r2_filter=SCATTER_R2_FILTER,
+#     title=f"Beta (Daily Changes: ΔBOX~ΔSPREAD) vs Spread LEVEL — R² ≥ {SCATTER_R2_FILTER:.2f}",
+#     x_label="Spread Level (bps)")
+# plot_scatter_beta_yearcolored(master, kind="chg", driver="curve", window=WINDOW_DAYS,
 #     x_on="CURVE_bps", r2_filter=None,
-#     title="Beta (Levels: BOX~CURVE) vs Curve Level — no R² filter",
+#     title="Beta (Daily Changes: ΔBOX~ΔCURVE) vs Curve LEVEL — no R² filter",
 #     x_label="Curve Level (bps)")
-# plot_scatter_beta_yearcolored(master, "lvl", "curve", WINDOW_DAYS,
+# plot_scatter_beta_yearcolored(master, kind="chg", driver="curve", window=WINDOW_DAYS,
 #     x_on="CURVE_bps", r2_filter=SCATTER_R2_FILTER,
-#     title=f"Beta (Levels: BOX~CURVE) vs Curve Level — R² ≥ {SCATTER_R2_FILTER:.2f}",
+#     title=f"Beta (Daily Changes: ΔBOX~ΔCURVE) vs Curve LEVEL — R² ≥ {SCATTER_R2_FILTER:.2f}",
 #     x_label="Curve Level (bps)")
 
-# # 2) Plot BOX (sanity)
+# # 3) Plot simple BOX niveau
 # plot_box_level(master, title_suffix=f"— {COUNTRY_HIGH}-{COUNTRY_LOW} {MATU_SHORT}s{MATU_LONG}")
 
-# # 3) BACKTEST (réutilise lvl_*_w{WINDOW_DAYS})
+# # 4) BACKTEST (utilise Alpha/Beta/R² NIVEAUX w=WINDOW_DAYS, décisions à t0[i+L])
 # trades_df, pnl_tracker = backtest_from_master(
 #     master,
-#     window_days=WINDOW_DAYS,
-#     obs_window_days=OBS_WINDOW_DAYS,
-#     holding_days=HOLDING_DAYS,
-#     resid_threshold=RESID_THRESHOLD,
-#     r2_entry_threshold=R2_ENTRY_THRESHOLD,
+#     window_days=WINDOW_DAYS,         # doit matcher la RR calculée
+#     obs_window_days=OBS_WINDOW_DAYS, # L = 21
+#     holding_days=HOLDING_DAYS,       # H = 21
+#     resid_threshold=0.5,             # ex pour générer des entrées
+#     r2_entry_threshold=0.0,          # désactive le filtre pour sanity-check
 #     tp_mult=TP_MULT, sl_mult=SL_MULT, dv01_k=DV01_K,
-#     driver=DRIVER_FOR_SIGNAL
+#     driver="SPREAD"
 # )
-# print("=== Trades (head) ==="); print(trades_df.head(10))
-# print("NaNs in pnl_tracker:", int(pnl_tracker.isna().sum().sum()))
-# print("=== PnL tracker (head) ==="); print(pnl_tracker.head(10))
-# plot_cum_pnl_realized(trades_df,
-#     title=f"Realized PnL — {COUNTRY_HIGH}-{COUNTRY_LOW} {MATU_SHORT}s{MATU_LONG} | {DRIVER_FOR_SIGNAL} | W={WINDOW_DAYS}")
-# plot_portfolio_pnl(pnl_tracker,
-#     title=f"Portfolio MtM PnL — {COUNTRY_HIGH}-{COUNTRY_LOW} {MATU_SHORT}s{MATU_LONG} | {DRIVER_FOR_SIGNAL} | W={WINDOW_DAYS}")
+# # Les trades sont TRIÉS PAR ENTRY ici.
+# print(trades_df.head(10))
+# print(pnl_tracker.head(10))
+
+# plot_cum_pnl_realized(trades_df, title="Realized PnL (by Exit) — Levels RR")
+# plot_portfolio_pnl(pnl_tracker, title="Portfolio MtM PnL — Levels RR")
 
