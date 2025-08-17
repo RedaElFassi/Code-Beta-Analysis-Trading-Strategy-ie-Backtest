@@ -1,0 +1,797 @@
+# -*- coding: utf-8 -*-
+# =========================================================
+# Dash app — Box/Spread/Curve (Levels & Daily) + Backtest
+# =========================================================
+import math
+from typing import Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+
+import dash
+from dash import Dash, dcc, html, Input, Output, State, callback
+import plotly.graph_objs as go
+
+# =========================
+# Try to locate `data`
+# =========================
+try:
+    data  # type: ignore[name-defined]
+except Exception:
+    try:
+        from data_loader import data  # type: ignore
+    except Exception:
+        data = None  # affichera un warning dans l'UI
+
+# =========================
+# Config par défaut
+# =========================
+AVAILABLE_COUNTRIES = ["France", "Italy", "Spain"]
+BENCHMARK_CURVE_COUNTRY = "Germany"   # curve = DE long - DE short
+BASELINE_LOW_COUNTRY = "Germany"      # spread & box VS Germany
+AVAILABLE_MATURITIES = ["2Y","3Y","5Y","7Y","10Y","15Y","20Y","25Y","30Y"]
+
+# Sliders/options par défaut
+DEFAULT_WINDOW = 126
+WINDOW_OPTIONS = [
+    {"label": "3M (63)", "value": 63},
+    {"label": "6M (126)", "value": 126},
+    {"label": "1Y (252)", "value": 252},
+]
+OBS_OPTIONS = [
+    {"label": "1M (21)",  "value": 21},
+    {"label": "2M (42)",  "value": 42},
+    {"label": "3M (63)",  "value": 63},
+    {"label": "6M (126)", "value": 126},
+]
+HOLD_OPTIONS = OBS_OPTIONS
+
+# Backtest params (DV01 fixe à 10k€)
+DEFAULT_R2_SCATTER = 0.30
+DEFAULT_R2_BACKTEST = 0.30
+DEFAULT_EPS_THR = 0.5
+DEFAULT_TP_MULT = 0.5
+DEFAULT_SL_MULT = 0.5
+DV01_K = 10.0  # k€
+
+# =========================
+# Helpers noms/colonnes
+# =========================
+def _col(country, matu):
+    return f"{country} {matu}"
+
+def _safe_name(x):
+    return x.replace(" ", "_")
+
+def _col_bps(country, matu):
+    return f"{_safe_name(country)}_{matu}_bps"
+
+def ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.copy()
+        df.index = pd.to_datetime(df.index)
+    return df.sort_index()
+
+# =========================
+# Master unique (tout centralisé)
+# =========================
+def build_master_dataframe(
+    raw: pd.DataFrame,
+    country_high: str,
+    country_low: str,
+    matu_long: str,
+    matu_short: str,
+    window: int,
+    curve_country: str = BENCHMARK_CURVE_COUNTRY,
+) -> pd.DataFrame:
+    """
+    Construit le master avec:
+      - Taux nécessaires convertis en bps (data en % → *100).
+      - BOX_bps, SPREAD_bps (maturité = long), CURVE_bps (DE long - DE short) + daily changes.
+      - Rolling OLS (fenêtre = `window`) pour:
+          * NIVEAUX:  BOX ~ SPREAD, BOX ~ CURVE
+          * DAILY Δ:  dBOX ~ dSPREAD, dBOX ~ dCURVE
+        Colonnes: {lvl|chg}_{spread|curve}_{alpha|beta|r2|tstat|resid}_w{window}
+    """
+    df = ensure_dt_index(raw)
+    master = pd.DataFrame(index=df.index)
+
+    cols_needed = [
+        _col(country_high, matu_long),
+        _col(country_low,  matu_long),
+        _col(country_high, matu_short),
+        _col(country_low,  matu_short),
+        _col(curve_country, matu_long),
+        _col(curve_country, matu_short),
+    ]
+    missing = [c for c in cols_needed if c not in df.columns]
+    if missing:
+        raise KeyError(f"Colonnes manquantes dans `data`: {missing}")
+
+    # 1) Taux en bps
+    master[_col_bps(country_high, matu_long)]  = df[_col(country_high, matu_long)].astype(float)  * 100.0
+    master[_col_bps(country_low,  matu_long)]  = df[_col(country_low,  matu_long)].astype(float)  * 100.0
+    master[_col_bps(country_high, matu_short)] = df[_col(country_high, matu_short)].astype(float) * 100.0
+    master[_col_bps(country_low,  matu_short)] = df[_col(country_low,  matu_short)].astype(float) * 100.0
+
+    # 2) Séries dérivées (bps)
+    master["BOX_bps"] = (
+        master[_col_bps(country_high, matu_long)] - master[_col_bps(country_low,  matu_long)]
+        - (master[_col_bps(country_high, matu_short)] - master[_col_bps(country_low,  matu_short)])
+    )
+    # SPREAD (maturité du spread = LONG)
+    master["SPREAD_bps"] = (df[_col(country_high, matu_long)].astype(float)
+                            - df[_col(country_low, matu_long)].astype(float)) * 100.0
+    # CURVE (bench Germany): DE long - DE short
+    master["CURVE_bps"] = (df[_col(curve_country, matu_long)].astype(float)
+                           - df[_col(curve_country, matu_short)].astype(float)) * 100.0
+
+    # 3) Daily changes
+    master["dBOX_bps"]    = master["BOX_bps"].diff()
+    master["dSPREAD_bps"] = master["SPREAD_bps"].diff()
+    master["dCURVE_bps"]  = master["CURVE_bps"].diff()
+
+    # 4) Rolling OLS writer
+    def _rolling_ols_write(ycol, xcol, w, prefix):
+        for suff in ["alpha","beta","r2","tstat","resid"]:
+            master[f"{prefix}_{suff}_w{w}"] = np.nan
+
+        join = pd.concat([master[ycol].rename("y"), master[xcol].rename("x")], axis=1).dropna()
+        if len(join) < w:
+            return
+
+        yv, xv, idx = join["y"].values, join["x"].values, join.index
+        out = []
+        for end in range(w, len(join)+1):
+            yy = yv[end-w:end]; xx = xv[end-w:end]
+            X = sm.add_constant(xx, has_constant="add")
+            fit = sm.OLS(yy, X).fit()
+            last_y, last_x = yy[-1], xx[-1]
+            yhat_last = fit.params[0] + fit.params[1]*last_x
+            out.append((idx[end-1], float(fit.params[0]), float(fit.params[1]),
+                        float(fit.rsquared), float(fit.tvalues[1]), float(last_y - yhat_last)))
+        rr = pd.DataFrame(out, columns=["Date","alpha","beta","r2","tstat","resid"]).set_index("Date")
+        for c in ["alpha","beta","r2","tstat","resid"]:
+            master.loc[rr.index, f"{prefix}_{c}_w{w}"] = rr[c]
+
+    w = int(window)
+    # Levels
+    _rolling_ols_write("BOX_bps",  "SPREAD_bps", w, "lvl_spread")
+    _rolling_ols_write("BOX_bps",  "CURVE_bps",  w, "lvl_curve")
+    # Daily changes
+    _rolling_ols_write("dBOX_bps", "dSPREAD_bps", w, "chg_spread")
+    _rolling_ols_write("dBOX_bps", "dCURVE_bps",  w, "chg_curve")
+
+    return master
+
+# =========================
+# Backtest (depuis master)
+# =========================
+def _first_cross(delta_series: pd.Series, tp: float, sl: float, side: int):
+    """
+    side=+1 (LONG_BOX): TP si Δ<=-tp ; SL si Δ>=+sl
+    side=-1 (SHORT_BOX): TP si Δ>=+tp ; SL si Δ<=-sl
+    """
+    for dt, d in delta_series.items():
+        if side == +1:
+            if d <= -tp: return dt, "TP"
+            if d >=  sl: return dt, "SL"
+        else:
+            if d >=  tp: return dt, "TP"
+            if d <= -sl: return dt, "SL"
+    return delta_series.index[-1], "TIME"
+
+def backtest_from_master(
+    master: pd.DataFrame,
+    window: int,
+    obs_window_days: int,
+    holding_days: int,
+    resid_threshold: float,
+    r2_entry_threshold: float,
+    tp_mult: float,
+    sl_mult: float,
+    dv01_k: float = DV01_K,
+    driver: str = "SPREAD"
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    d = driver.lower()  # "spread"
+    w = int(window)
+
+    alpha_col = f"lvl_{d}_alpha_w{w}"
+    beta_col  = f"lvl_{d}_beta_w{w}"
+    r2_col    = f"lvl_{d}_r2_w{w}"
+    x_col     = f"{driver.upper()}_bps"  # "SPREAD_bps"
+    y_col     = "BOX_bps"
+
+    need = [alpha_col, beta_col, r2_col, x_col, y_col]
+    for c in need:
+        if c not in master.columns:
+            return pd.DataFrame(), pd.DataFrame()
+
+    idx = master.index
+
+    valid_mask = master[[alpha_col, beta_col, r2_col]].notna().all(axis=1)
+    rr_dates = idx[valid_mask].sort_values()
+    if len(rr_dates) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    trades = []
+    L = int(obs_window_days)
+    H = int(holding_days)
+    thr = float(resid_threshold)
+    tp_m = float(tp_mult)
+    sl_m = float(sl_mult)
+    dv = float(dv01_k)
+
+    for i in range(0, len(rr_dates) - L):
+        t0 = rr_dates[i]
+        entry_date = rr_dates[i + L]
+
+        x_t = master.at[entry_date, x_col]
+        y_t = master.at[entry_date, y_col]
+        if pd.isna(x_t) or pd.isna(y_t):
+            continue
+
+        a0 = master.at[t0, alpha_col]
+        b0 = master.at[t0, beta_col]
+        r2 = master.at[t0, r2_col]
+        if pd.isna(a0) or pd.isna(b0) or pd.isna(r2):
+            continue
+
+        y_hat = float(a0) + float(b0) * float(x_t)
+        eps = float(y_t) - y_hat
+        if (abs(eps) < thr) or (float(r2) < float(r2_entry_threshold)):
+            continue
+
+        side = +1 if eps > 0 else -1
+        entry_box = float(y_t)
+
+        entry_pos = idx.get_loc(entry_date)
+        exit_pos_lim = min(entry_pos + H, len(idx) - 1)
+        path = master.iloc[entry_pos+1: exit_pos_lim+1][y_col].dropna()
+
+        if len(path) == 0:
+            exit_date = entry_date
+            exit_box = entry_box
+            reason = "TIME"
+        else:
+            delta = path - entry_box
+            tp = tp_m * thr
+            sl = sl_m * thr
+            exit_date, reason = _first_cross(delta, tp, sl, side)
+            exit_box = float(master.at[exit_date, y_col])
+
+        pnl = -side * (exit_box - entry_box) * dv
+
+        trades.append({
+            "Entry": entry_date,
+            "Exit": exit_date,
+            "Side": "LONG_BOX" if side == +1 else "SHORT_BOX",
+            "EntryBox": entry_box,
+            "Predicted": y_hat,
+            "Residual": eps,
+            "Beta": float(b0),
+            "R2": float(r2),
+            "Reason": reason,
+            "ExitBox": exit_box,
+            "PnL": pnl
+        })
+
+    trades_df = pd.DataFrame(trades)
+    if trades_df.empty:
+        return trades_df, pd.DataFrame()
+
+    # Tri par Entry (stabilisé par Exit)
+    trades_df = trades_df.sort_values(["Entry", "Exit"]).reset_index(drop=True)
+
+    # Cumul by entry
+    trades_df["RealizedCumPnL_by_entry"] = trades_df["PnL"].cumsum()
+    # Cumul by exit (ordre de sortie)
+    order_by_exit = trades_df.sort_values("Exit").index
+    trades_df["RealizedCumPnL_by_exit"] = np.nan
+    trades_df.loc[order_by_exit, "RealizedCumPnL_by_exit"] = (
+        trades_df.loc[order_by_exit, "PnL"].cumsum().values
+    )
+
+    # PnL tracker MtM — sans NaN
+    start_all = trades_df["Entry"].min()
+    end_all   = trades_df["Exit"].max()
+    dates = master.loc[(master.index >= start_all) & (master.index <= end_all)].index
+    pnl_tracker = pd.DataFrame(index=dates)
+
+    for i, row in trades_df.iterrows():
+        entry = row["Entry"]; exit_ = row["Exit"]
+        side  = +1 if row["Side"] == "LONG_BOX" else -1
+        entry_box = float(row["EntryBox"])
+
+        path = master.loc[(master.index > entry) & (master.index <= exit_), y_col].dropna()
+        mtm = -side * (path - entry_box) * dv
+
+        ser = pd.Series(0.0, index=dates, dtype=float)
+        if len(mtm) > 0:
+            ser.loc[mtm.index] = mtm.values
+            last_val = float(mtm.iloc[-1])
+        else:
+            last_val = 0.0
+        ser.loc[ser.index > exit_] = last_val
+
+        pnl_tracker[f"Trade_{i+1:03d}"] = ser
+
+    pnl_tracker = pnl_tracker.fillna(0.0)
+    pnl_tracker["CumPnL"] = pnl_tracker.sum(axis=1)
+
+    return trades_df, pnl_tracker
+
+# =========================
+# Plotly figure helpers
+# =========================
+def fig_ts(y: pd.Series, title: str, ylab: str) -> go.Figure:
+    y = y.dropna()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=y.index, y=y.values, mode="lines", name=ylab))
+    fig.update_layout(
+        title=title, template="plotly_white",
+        xaxis=dict(tickformat="%Y"),
+        yaxis=dict(title=ylab),
+        margin=dict(l=50, r=20, t=50, b=40),
+        legend=dict(orientation="h", y=1.02, x=1, xanchor="right")
+    )
+    return fig
+
+def fig_scatter_heatmap_with_poly(
+    x: pd.Series, y: pd.Series, index: pd.DatetimeIndex,
+    title: str, xlab: str, ylab: str, poly_deg: int = 2
+) -> go.Figure:
+    dfp = pd.DataFrame({"x": x, "y": y}, index=pd.to_datetime(index)).dropna()
+    fig = go.Figure()
+    fig.update_layout(
+        title=title, xaxis_title=xlab, yaxis_title=ylab, template="plotly_white",
+        margin=dict(l=50, r=70, t=50, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    if dfp.empty:
+        return fig
+
+    years = dfp.index.year
+    cmin, cmax = int(years.min()), int(years.max())
+    fig.add_trace(go.Scatter(
+        x=dfp["x"], y=dfp["y"], mode="markers",
+        marker=dict(size=6, color=years, colorscale="RdBu_r", cmin=cmin, cmax=cmax, showscale=True,
+                    colorbar=dict(title="Year", x=1.02)),
+        hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<extra></extra>",
+        showlegend=False
+    ))
+
+    if len(dfp) >= (poly_deg + 1):
+        try:
+            xs = dfp["x"].values; ys = dfp["y"].values
+            order = np.argsort(xs)
+            xs_sorted, ys_sorted = xs[order], ys[order]
+            coeffs = np.polyfit(xs_sorted, ys_sorted, deg=poly_deg)
+            x_line = np.linspace(xs_sorted.min(), xs_sorted.max(), 300)
+            y_line = np.polyval(coeffs, x_line)
+            fig.add_trace(go.Scatter(
+                x=x_line, y=y_line, mode="lines",
+                line=dict(color="black", width=2),
+                name=f"Poly fit (deg={poly_deg})",
+                hoverinfo="skip"
+            ))
+        except Exception:
+            pass
+    return fig
+
+def fig_scatter_beta_year_heat(
+    master: pd.DataFrame,
+    beta_col: str,
+    x_level_col: str,
+    r2_col: Optional[str] = None,
+    r2_min: Optional[float] = None,
+    title: str = "",
+    xlab: str = "Level (bps)",
+    ylab: str = "Beta",
+) -> go.Figure:
+    cols = [beta_col, x_level_col]
+    if r2_col:
+        cols.append(r2_col)
+    df = master[cols].dropna()
+    if r2_col and (r2_min is not None):
+        df = df[df[r2_col] >= float(r2_min)]
+    if df.empty:
+        return go.Figure()
+
+    return fig_scatter_heatmap_with_poly(
+        x=df[x_level_col], y=df[beta_col], index=df.index,
+        title=title, xlab=xlab, ylab=ylab, poly_deg=2
+    )
+
+# =========================
+# Simple cache (master)
+# =========================
+_MASTER_CACHE: Dict[Tuple[str,str,str,int], pd.DataFrame] = {}
+
+def get_master_cached(country: str, long_m: str, short_m: str, window: int) -> Optional[pd.DataFrame]:
+    key = (country, long_m, short_m, int(window))
+    if key in _MASTER_CACHE:
+        return _MASTER_CACHE[key]
+    if data is None:
+        return None
+    try:
+        m = build_master_dataframe(
+            data, country_high=country, country_low=BASELINE_LOW_COUNTRY,
+            matu_long=long_m, matu_short=short_m, window=int(window),
+            curve_country=BENCHMARK_CURVE_COUNTRY
+        )
+        _MASTER_CACHE[key] = m
+        return m
+    except Exception:
+        return None
+
+# =========================
+# Dash app
+# =========================
+app: Dash = dash.Dash(__name__)
+app.title = "Box/Spread/CURVE — Dash"
+
+def build_country_options():
+    return [{"label": c, "value": c} for c in AVAILABLE_COUNTRIES]
+
+def build_maturity_options():
+    return [{"label": m, "value": m} for m in AVAILABLE_MATURITIES]
+
+app.layout = html.Div([
+    html.H2("📊 Box vs Spread/Curve — Regressions & Backtest (Dash)"),
+    html.Div(id="warn-data", style={"color": "crimson", "marginBottom": "8px"}),
+
+    html.Div([
+        html.Div([
+            html.Label("Country (HIGH leg) vs Germany"),
+            dcc.RadioItems(id="country", options=build_country_options(),
+                           value=("Italy" if "Italy" in AVAILABLE_COUNTRIES else AVAILABLE_COUNTRIES[0]),
+                           inline=True),
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+
+        html.Div([
+            html.Label("Long maturity"),
+            dcc.RadioItems(id="matu-long", options=build_maturity_options(),
+                           value=("10Y" if "10Y" in AVAILABLE_MATURITIES else AVAILABLE_MATURITIES[-1]),
+                           inline=True),
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+
+        html.Div([
+            html.Label("Short maturity"),
+            dcc.RadioItems(id="matu-short", options=build_maturity_options(),
+                           value=("5Y" if "5Y" in AVAILABLE_MATURITIES else AVAILABLE_MATURITIES[0]),
+                           inline=True),
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+
+        html.Div([
+            html.Label("Rolling window (one & only)"),
+            dcc.RadioItems(id="window", options=WINDOW_OPTIONS, value=DEFAULT_WINDOW, inline=True),
+        ], style={"display": "inline-block"}),
+    ], style={"marginBottom": "12px"}),
+
+    html.Div(id="warn-maturity", style={"color": "crimson", "marginBottom": "8px"}),
+
+    html.Div([
+        html.Div([
+            html.Label("Obs period (L)"),
+            dcc.RadioItems(id="obs", options=OBS_OPTIONS, value=21, inline=True),
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+
+        html.Div([
+            html.Label("Holding (H)"),
+            dcc.RadioItems(id="hold", options=HOLD_OPTIONS, value=21, inline=True),
+        ], style={"display": "inline-block", "marginRight": "24px"}),
+
+        html.Div([
+            html.Label("R² threshold (scatter only)"),
+            dcc.Slider(id="r2-scatter", min=0.0, max=1.0, step=0.05, value=DEFAULT_R2_SCATTER,
+                       marks={i/10: f"{i/10:.1f}" for i in range(0, 11)}),
+        ], style={"width": "32%", "display": "inline-block", "verticalAlign": "top", "marginRight": "16px"}),
+
+        html.Div([
+            html.Label("R² threshold (backtest)"),
+            dcc.Slider(id="r2-bt", min=0.0, max=1.0, step=0.05, value=DEFAULT_R2_BACKTEST,
+                       marks={i/10: f"{i/10:.1f}" for i in range(0, 11)}),
+        ], style={"width": "32%", "display": "inline-block", "verticalAlign": "top"}),
+    ], style={"marginBottom": "6px"}),
+
+    html.Div([
+        html.Div([
+            html.Label("ε threshold (|epsilon|)"),
+            dcc.Slider(id="eps", min=0.0, max=5.0, step=0.1, value=DEFAULT_EPS_THR,
+                       marks={i: str(i) for i in range(0, 6)}),
+        ], style={"width": "32%", "display": "inline-block", "verticalAlign": "top", "marginRight": "16px"}),
+
+        html.Div([
+            html.Label("TP mult (× ε)"),
+            dcc.Slider(id="tp", min=0.0, max=1.0, step=0.05, value=DEFAULT_TP_MULT,
+                       marks={i/20: f"{i/20:.2f}" for i in range(0, 21, 5)}),
+        ], style={"width": "32%", "display": "inline-block", "verticalAlign": "top", "marginRight": "16px"}),
+
+        html.Div([
+            html.Label("SL mult (× ε)"),
+            dcc.Slider(id="sl", min=0.0, max=1.0, step=0.05, value=DEFAULT_SL_MULT,
+                       marks={i/20: f"{i/20:.2f}" for i in range(0, 21, 5)}),
+        ], style={"width": "32%", "display": "inline-block", "verticalAlign": "top"}),
+    ], style={"marginBottom": "18px"}),
+
+    html.Hr(),
+    html.H3("1) Regression of Box Level vs Spread Level"),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_lvs_r2",   config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+        html.Div([dcc.Graph(id="fig_lvs_beta", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+    ]),
+    dcc.Graph(id="fig_lvs_resid", config={"displaylogo": False}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_lvs_scatter_all", config={"displaylogo": False})], style={"width":"49%","display":"inline-block"}),
+        html.Div([dcc.Graph(id="fig_lvs_scatter_r2",  config={"displaylogo": False})], style={"width":"49%","display":"inline-block"}),
+    ]),
+
+    html.Hr(),
+    html.H3("2) Regression of Box Level vs Curve Level (Germany)"),
+    html.Div(id="curve-note", style={"fontStyle":"italic", "color":"#555", "marginBottom":"8px"}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_lvc_r2",   config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+        html.Div([dcc.Graph(id="fig_lvc_beta", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+    ]),
+    dcc.Graph(id="fig_lvc_resid", config={"displaylogo": False}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_lvc_scatter_all", config={"displaylogo": False})], style={"width":"49%","display":"inline-block"}),
+        html.Div([dcc.Graph(id="fig_lvc_scatter_r2",  config={"displaylogo": False})], style={"width":"49%","display":"inline-block"}),
+    ]),
+
+    html.Hr(),
+    html.H3("3) Regression of Daily Box Changes vs Daily Spread Changes"),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_dvs_r2",   config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+        html.Div([dcc.Graph(id="fig_dvs_beta", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+    ]),
+    dcc.Graph(id="fig_dvs_resid", config={"displaylogo": False}),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_dvs_scatter_all", config={"displaylogo": False})], style={"width":"49%","display":"inline-block"}),
+        html.Div([dcc.Graph(id="fig_dvs_scatter_r2",  config={"displaylogo": False})], style={"width":"49%","display":"inline-block"}),
+    ]),
+
+    html.Hr(),
+    html.H3("4) Backtest (driver = Spread)"),
+    html.Div([
+        html.Div([dcc.Graph(id="fig_pnl_real", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+        html.Div([dcc.Graph(id="fig_pnl_mtm",  config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
+    ]),
+
+    html.Div(id="warn-end", style={"color": "#777", "marginTop": "8px", "fontStyle":"italic"})
+])
+
+# =========================
+# Callback principal
+# =========================
+@callback(
+    Output("warn-data", "children"),
+    Output("warn-maturity", "children"),
+    Output("curve-note", "children"),
+
+    Output("fig_lvs_r2", "figure"),
+    Output("fig_lvs_beta", "figure"),
+    Output("fig_lvs_resid", "figure"),
+    Output("fig_lvs_scatter_all", "figure"),
+    Output("fig_lvs_scatter_r2", "figure"),
+
+    Output("fig_lvc_r2", "figure"),
+    Output("fig_lvc_beta", "figure"),
+    Output("fig_lvc_resid", "figure"),
+    Output("fig_lvc_scatter_all", "figure"),
+    Output("fig_lvc_scatter_r2", "figure"),
+
+    Output("fig_dvs_r2", "figure"),
+    Output("fig_dvs_beta", "figure"),
+    Output("fig_dvs_resid", "figure"),
+    Output("fig_dvs_scatter_all", "figure"),
+    Output("fig_dvs_scatter_r2", "figure"),
+
+    Output("fig_pnl_real", "figure"),
+    Output("fig_pnl_mtm", "figure"),
+
+    Output("warn-end", "children"),
+
+    Input("country", "value"),
+    Input("matu-long", "value"),
+    Input("matu-short", "value"),
+    Input("window", "value"),
+
+    Input("obs", "value"),
+    Input("hold", "value"),
+    Input("r2-scatter", "value"),
+    Input("r2-bt", "value"),
+    Input("eps", "value"),
+    Input("tp", "value"),
+    Input("sl", "value"),
+)
+def update_all(country, m_long, m_short, window,
+               obs, hold, r2_scatter, r2_bt, eps_thr, tp_mult, sl_mult):
+
+    empty = go.Figure()
+    if data is None:
+        return ("No `data` DataFrame found. Provide it via `data_loader.py` or globally.",
+                "", "",
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty,
+                "")
+
+    # Validations
+    warn_m = ""
+    if country not in AVAILABLE_COUNTRIES:
+        country = AVAILABLE_COUNTRIES[0]
+    if (m_long not in AVAILABLE_MATURITIES) or (m_short not in AVAILABLE_MATURITIES):
+        warn_m = "Select valid maturities."
+        return ("", warn_m, "",
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty,
+                "")
+    # impose Long > Short (num)
+    try:
+        Lnum = int(m_long.replace("Y",""))
+        Snum = int(m_short.replace("Y",""))
+    except Exception:
+        warn_m = "Maturity parsing error."
+        return ("", warn_m, "",
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty,
+                "")
+    if Lnum <= Snum:
+        warn_m = "⚠️ Long maturity must be strictly greater than Short maturity."
+
+    # Build master (cached)
+    master = get_master_cached(country, m_long, m_short, int(window))
+    if master is None or master.empty:
+        return ("", warn_m or "No data for this selection.", "",
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty,
+                "")
+
+    w = int(window)
+    # Column names
+    lvs_r2   = f"lvl_spread_r2_w{w}"
+    lvs_beta = f"lvl_spread_beta_w{w}"
+    lvs_res  = f"lvl_spread_resid_w{w}"
+
+    lvc_r2   = f"lvl_curve_r2_w{w}"
+    lvc_beta = f"lvl_curve_beta_w{w}"
+    lvc_res  = f"lvl_curve_resid_w{w}"
+
+    dvs_r2   = f"chg_spread_r2_w{w}"
+    dvs_beta = f"chg_spread_beta_w{w}"
+    dvs_res  = f"chg_spread_resid_w{w}"
+
+    # ===== Section 1: Levels vs Spread =====
+    fig_lvs_r2   = fig_ts(master[lvs_r2],   f"R² — BOX (bps) ~ SPREAD (bps) — window={w}", "R²")
+    fig_lvs_beta = fig_ts(master[lvs_beta], f"Beta — BOX (bps) ~ SPREAD (bps) — window={w}", "Beta")
+    fig_lvs_res  = fig_ts(master[lvs_res],  f"Residual (at window end) — BOX~SPREAD — window={w}", "Residual (bps)")
+
+    fig_lvs_sc_all = fig_scatter_beta_year_heat(
+        master, beta_col=lvs_beta, x_level_col="SPREAD_bps",
+        title="Beta (Levels: BOX~SPREAD) vs SPREAD level — ALL", xlab="Spread level (bps)", ylab="Beta"
+    )
+    fig_lvs_sc_r2  = fig_scatter_beta_year_heat(
+        master, beta_col=lvs_beta, x_level_col="SPREAD_bps", r2_col=lvs_r2, r2_min=float(r2_scatter),
+        title=f"Beta (Levels: BOX~SPREAD) vs SPREAD level — R² ≥ {float(r2_scatter):.2f}",
+        xlab="Spread level (bps)", ylab="Beta"
+    )
+
+    # ===== Section 2: Levels vs Curve =====
+    curve_note = f"Curve used = {BENCHMARK_CURVE_COUNTRY} {m_short}s{m_long} (i.e., {m_long} − {m_short})"
+    fig_lvc_r2   = fig_ts(master[lvc_r2],   f"R² — BOX (bps) ~ CURVE (bps, DE {m_short}s{m_long}) — window={w}", "R²")
+    fig_lvc_beta = fig_ts(master[lvc_beta], f"Beta — BOX (bps) ~ CURVE (bps, DE {m_short}s{m_long}) — window={w}", "Beta")
+    fig_lvc_res  = fig_ts(master[lvc_res],  f"Residual (at window end) — BOX~CURVE — window={w}", "Residual (bps)")
+
+    fig_lvc_sc_all = fig_scatter_beta_year_heat(
+        master, beta_col=lvc_beta, x_level_col="CURVE_bps",
+        title="Beta (Levels: BOX~CURVE) vs CURVE level — ALL", xlab="Curve level (bps)", ylab="Beta"
+    )
+    fig_lvc_sc_r2  = fig_scatter_beta_year_heat(
+        master, beta_col=lvc_beta, x_level_col="CURVE_bps", r2_col=lvc_r2, r2_min=float(r2_scatter),
+        title=f"Beta (Levels: BOX~CURVE) vs CURVE level — R² ≥ {float(r2_scatter):.2f}",
+        xlab="Curve level (bps)", ylab="Beta"
+    )
+
+    # ===== Section 3: Daily Δ — dBOX ~ dSPREAD (scatter vs SPREAD LEVEL) =====
+    fig_dvs_r2   = fig_ts(master[dvs_r2],   f"R² — ΔBOX ~ ΔSPREAD — window={w}", "R²")
+    fig_dvs_beta = fig_ts(master[dvs_beta], f"Beta — ΔBOX ~ ΔSPREAD — window={w}", "Beta")
+    fig_dvs_res  = fig_ts(master[dvs_res],  f"Residual (at window end) — ΔBOX~ΔSPREAD — window={w}", "Residual (bps)")
+
+    fig_dvs_sc_all = fig_scatter_beta_year_heat(
+        master, beta_col=dvs_beta, x_level_col="SPREAD_bps",
+        title="Beta (ΔBOX~ΔSPREAD) vs SPREAD level — ALL", xlab="Spread level (bps)", ylab="Beta"
+    )
+    fig_dvs_sc_r2  = fig_scatter_beta_year_heat(
+        master, beta_col=dvs_beta, x_level_col="SPREAD_bps", r2_col=dvs_r2, r2_min=float(r2_scatter),
+        title=f"Beta (ΔBOX~ΔSPREAD) vs SPREAD level — R² ≥ {float(r2_scatter):.2f}",
+        xlab="Spread level (bps)", ylab="Beta"
+    )
+
+    # ===== Section 4: Backtest (driver = SPREAD) =====
+    trades_df, pnl_tracker = backtest_from_master(
+        master,
+        window=w,
+        obs_window_days=int(obs),
+        holding_days=int(hold),
+        resid_threshold=float(eps_thr),
+        r2_entry_threshold=float(r2_bt),
+        tp_mult=float(tp_mult),
+        sl_mult=float(sl_mult),
+        dv01_k=DV01_K,
+        driver="SPREAD"
+    )
+
+    if trades_df.empty:
+        fig_pnl_real = go.Figure()
+        fig_pnl_real.update_layout(title="Realized Cum PnL (by Exit) — No trades", template="plotly_white")
+        fig_pnl_mtm  = go.Figure()
+        fig_pnl_mtm.update_layout(title="Portfolio MtM PnL — No trades", template="plotly_white")
+    else:
+        # realized by exit
+        y = trades_df.dropna(subset=["RealizedCumPnL_by_exit"])
+        fig_pnl_real = go.Figure()
+        fig_pnl_real.add_trace(go.Scatter(x=y["Exit"], y=y["RealizedCumPnL_by_exit"], mode="lines", name="CumPnL (k€)"))
+        fig_pnl_real.update_layout(
+            title="Realized Cumulative PnL (by Exit)", template="plotly_white",
+            xaxis=dict(tickformat="%Y"), yaxis=dict(title="k€"),
+            margin=dict(l=50, r=20, t=50, b=40)
+        )
+
+        # portfolio MtM
+        fig_pnl_mtm = go.Figure()
+        if not pnl_tracker.empty and "CumPnL" in pnl_tracker.columns:
+            fig_pnl_mtm.add_trace(go.Scatter(x=pnl_tracker.index, y=pnl_tracker["CumPnL"], mode="lines", name="CumPnL (k€)"))
+        fig_pnl_mtm.update_layout(
+            title="Portfolio MtM PnL", template="plotly_white",
+            xaxis=dict(tickformat="%Y"), yaxis=dict(title="k€"),
+            margin=dict(l=50, r=20, t=50, b=40)
+        )
+
+    warn_data = ""  # on a un `data`
+    warn_end = f"DV01 per trade = {DV01_K:.0f} k€. Backtest driver = SPREAD (maturity = {m_long})."
+
+    return (
+        warn_data,
+        warn_m,
+        curve_note,
+
+        fig_lvs_r2, fig_lvs_beta, fig_lvs_res, fig_lvs_sc_all, fig_lvs_sc_r2,
+        fig_lvc_r2, fig_lvc_beta, fig_lvc_res, fig_lvc_sc_all, fig_lvc_sc_r2,
+        fig_dvs_r2, fig_dvs_beta, fig_dvs_res, fig_dvs_sc_all, fig_dvs_sc_r2,
+        fig_pnl_real, fig_pnl_mtm,
+        warn_end
+    )
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    import webbrowser, socket
+    def get_local_ip():
+        import socket as _s
+        s = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]
+        except Exception: ip = "127.0.0.1"
+        finally: s.close()
+        return ip
+
+    host, port = "0.0.0.0", 8052
+    local_ip = get_local_ip()
+    print("\n================= SHARE THIS =================")
+    print(f"Local (toi)    : http://localhost:{port}")
+    print(f"Réseau (équipe): http://{local_ip}:{port}")
+    print("================================================\n")
+    try: webbrowser.open(f"http://localhost:{port}")
+    except Exception: pass
+    app.run_server(host=host, port=port, debug=False)
