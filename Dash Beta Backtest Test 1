@@ -1,0 +1,676 @@
+# box_quad_dashboard.py
+# =========================================================
+# Dash app — 4 sections :
+#   1) BOX Level vs SPREAD Level
+#   2) BOX Level vs CURVE (Germany) Level
+#   3) ΔBOX vs ΔSPREAD (daily changes)
+#   4) Backtest (Levels vs SPREAD)
+# Le tout via un master DataFrame unique (en bps) qui stocke séries + rolling OLS.
+# =========================================================
+
+import dash
+from dash import Dash, dcc, html, Input, Output, State, callback
+import plotly.graph_objs as go
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from typing import List, Tuple
+import socket
+
+# =========================================================
+# ====== Charger/obtenir `data` (DataFrame des taux en %) =
+# =========================================================
+try:
+    data  # type: ignore[name-defined]
+except Exception:
+    try:
+        from data_loader import data  # type: ignore
+    except Exception:
+        data = None  # la UI affichera un message si None
+
+
+# =========================================================
+# ===================== Helpers généraux ==================
+# =========================================================
+DEFAULT_COUNTRIES = ["France", "Italy", "Spain"]  # côté "high spread"
+BENCHMARK = "Germany"                             # fixe pour tout
+ALL_WINDOWS = [63, 126, 252]                      # on pré-calcule ces 3 tailles
+OBS_CHOICES = [21, 42, 63, 126]
+HOLD_CHOICES = [21, 42, 63, 126]
+
+def _col(country: str, matu: str) -> str:
+    """Nom de colonne dans `data`: 'Country Maturity' (en %)."""
+    return f"{country} {matu}"
+
+def _col_bps(country: str, matu: str) -> str:
+    """Nom interne (facultatif) pour stockage en bps dans `master`."""
+    return f"{country.replace(' ', '_')}_{matu}_bps"
+
+def maturities_for_country(df: pd.DataFrame, country: str) -> List[str]:
+    """Liste des maturités disponibles pour un pays (ex: ['2Y','5Y','7Y','10Y',...])."""
+    pref = f"{country} "
+    mats = []
+    for c in df.columns:
+        if c.startswith(pref):
+            parts = c.split(" ")
+            if len(parts) >= 2:
+                mats.append(parts[-1])
+    order = {"1Y":1,"2Y":2,"3Y":3,"4Y":4,"5Y":5,"7Y":7,"10Y":10,"15Y":15,"20Y":20,"25Y":25,"30Y":30}
+    return sorted(set(mats), key=lambda x: order.get(x, 999))
+
+
+# =========================================================
+# =============== Rolling OLS writer (générique) ==========
+# =========================================================
+def _rolling_ols_write(master: pd.DataFrame, ycol: str, xcol: str, window: int, prefix: str) -> None:
+    """
+    OLS glissante (fenêtre = `window` observations) sur y ~ const + x.
+    Ecrit 5 colonnes alignées sur la FIN de fenêtre:
+      {prefix}_alpha_w{window}, _beta_w{window}, _r2_w{window}, _tstat_w{window}, _resid_w{window}
+    - Toutes les colonnes y/x sont attendues en **bps**.
+    - resid = résiduel au dernier point de la fenêtre (y_T - yhat_T).
+    """
+    for suff in ["alpha","beta","r2","tstat","resid"]:
+        master[f"{prefix}_{suff}_w{window}"] = np.nan
+
+    df = master[[ycol, xcol]].dropna()
+    if len(df) < window:
+        return
+
+    y = df[ycol].values
+    x = df[xcol].values
+    idx = df.index
+
+    out_dates, al, bl, r2l, tl, rl = [], [], [], [], [], []
+    for end in range(window, len(df) + 1):
+        start = end - window
+        y_w = y[start:end]; x_w = x[start:end]
+        X = sm.add_constant(x_w, has_constant='add')
+        res = sm.OLS(y_w, X).fit()
+
+        last_y = y_w[-1]; last_x = x_w[-1]
+        yhat_last = res.params[0] + res.params[1] * last_x
+
+        out_dates.append(idx[end-1])
+        al.append(float(res.params[0]))
+        bl.append(float(res.params[1]))
+        r2l.append(float(res.rsquared))
+        tl.append(float(res.tvalues[1]))
+        rl.append(float(last_y - yhat_last))
+
+    rr = pd.DataFrame(
+        {"alpha":al, "beta":bl, "r2":r2l, "tstat":tl, "resid":rl},
+        index=pd.Index(out_dates, name="Date")
+    )
+    master.loc[rr.index, f"{prefix}_alpha_w{window}"] = rr["alpha"]
+    master.loc[rr.index, f"{prefix}_beta_w{window}"]  = rr["beta"]
+    master.loc[rr.index, f"{prefix}_r2_w{window}"]    = rr["r2"]
+    master.loc[rr.index, f"{prefix}_tstat_w{window}"] = rr["tstat"]
+    master.loc[rr.index, f"{prefix}_resid_w{window}"] = rr["resid"]
+
+
+# =========================================================
+# =================== Master central (bps) =================
+# =========================================================
+def build_master_dataframe(
+    df: pd.DataFrame,
+    country: str,
+    benchmark: str,
+    matu_long: str,
+    matu_short: str,
+    windows: List[int] = ALL_WINDOWS
+) -> pd.DataFrame:
+    """
+    Construit un **unique** DataFrame `master` (en bps) qui centralise :
+      - BOX_bps = (country_long - bench_long) - (country_short - bench_short)
+      - SPREAD_bps = (country_long - bench_long)                [driver SPREAD]
+      - CURVE_bps  = (bench_long - bench_short)                 [driver CURVE]
+      - dBOX_bps, dSPREAD_bps, dCURVE_bps (daily changes)
+      - Rolling OLS écrites pour **toutes** les fenêtres `windows` :
+          * lvl_spread_*_w{W} : BOX ~ SPREAD (niveaux)
+          * lvl_curve_*_w{W}  : BOX ~ CURVE  (niveaux)
+          * chg_spread_*_w{W} : ΔBOX ~ ΔSPREAD (daily changes)
+    """
+    master = pd.DataFrame(index=pd.to_datetime(df.index)).sort_index()
+
+    need = [
+        _col(country, matu_long), _col(benchmark, matu_long),
+        _col(country, matu_short), _col(benchmark, matu_short),
+    ]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise KeyError(f"Colonnes manquantes dans `data`: {missing}")
+
+    # % -> bps
+    cL = _col_bps(country,  matu_long)
+    bL = _col_bps(benchmark, matu_long)
+    cS = _col_bps(country,  matu_short)
+    bS = _col_bps(benchmark, matu_short)
+    master[cL] = df[_col(country,  matu_long)].astype(float) * 100.0
+    master[bL] = df[_col(benchmark, matu_long)].astype(float) * 100.0
+    master[cS] = df[_col(country,  matu_short)].astype(float) * 100.0
+    master[bS] = df[_col(benchmark, matu_short)].astype(float) * 100.0
+
+    # Séries structurantes
+    master["BOX_bps"]    = (master[cL] - master[bL]) - (master[cS] - master[bS])
+    master["SPREAD_bps"] = (df[_col(country, matu_long)] - df[_col(benchmark, matu_long)]) * 100.0
+    master["CURVE_bps"]  = (df[_col(benchmark, matu_long)] - df[_col(benchmark, matu_short)]) * 100.0
+
+    # Daily changes
+    master["dBOX_bps"]    = master["BOX_bps"].diff()
+    master["dSPREAD_bps"] = master["SPREAD_bps"].diff()
+    master["dCURVE_bps"]  = master["CURVE_bps"].diff()
+
+    # Rolling OLS pour toutes les fenêtres
+    for w in sorted(set(int(x) for x in windows)):
+        # 1) Levels: BOX ~ SPREAD
+        _rolling_ols_write(master, "BOX_bps", "SPREAD_bps", w, prefix="lvl_spread")
+        # 2) Levels: BOX ~ CURVE
+        _rolling_ols_write(master, "BOX_bps", "CURVE_bps",  w, prefix="lvl_curve")
+        # 3) Daily changes: ΔBOX ~ ΔSPREAD
+        _rolling_ols_write(master, "dBOX_bps", "dSPREAD_bps", w, prefix="chg_spread")
+
+    return master
+
+
+# =========================================================
+# ================= Backtest (depuis master) ==============
+# =========================================================
+def _first_cross(delta_series: pd.Series, tp: float, sl: float, side: int) -> Tuple[pd.Timestamp, str]:
+    """
+    Première occurrence: TP/SL sinon TIME.
+      LONG (side=+1): TP si Δ<=-tp ; SL si Δ>=+sl
+      SHORT (side=-1): TP si Δ>=+tp ; SL si Δ<=-sl
+    """
+    for dt, d in delta_series.items():
+        if side == +1:
+            if d <= -tp: return dt, "TP"
+            if d >=  sl: return dt, "SL"
+        else:
+            if d >=  tp: return dt, "TP"
+            if d <= -sl: return dt, "SL"
+    return delta_series.index[-1], "TIME"
+
+def run_backtest_from_master(
+    master: pd.DataFrame,
+    window: int,
+    obs_days: int,
+    hold_days: int,
+    resid_threshold: float,
+    r2_entry_threshold: float,
+    tp_mult: float,
+    sl_mult: float,
+    dv01_k: float = 10.0
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Backtest (Levels vs SPREAD) basé sur les colonnes lvl_spread_*_w{window}.
+    Entrée à t = t0 + obs_days (décalage en **observations**).
+    ε_t = BOX_t - (alpha(t0) + beta(t0)*SPREAD_t).
+    Filtre d'entrée: |ε_t| ≥ resid_threshold ET R²(t0) ≥ r2_entry_threshold.
+    Sortie: TP/SL/TIME sur `hold_days` obs. PnL = -side * (ExitBox - EntryBox) * dv01_k.
+    Retourne trades_df + pnl_tracker (MtM cumulé).
+    """
+    a_col = f"lvl_spread_alpha_w{window}"
+    b_col = f"lvl_spread_beta_w{window}"
+    r_col = f"lvl_spread_r2_w{window}"
+
+    for c in [a_col, b_col, r_col, "BOX_bps", "SPREAD_bps"]:
+        if c not in master.columns:
+            raise KeyError(f"Colonne manquante pour backtest: {c}")
+
+    idx = master.index
+    trades = []
+    valid_t0 = idx[ master[[a_col,b_col,r_col]].notna().all(axis=1) ]
+
+    for t0 in valid_t0:
+        pos0 = idx.get_indexer([t0])[0]
+        entry_pos = pos0 + obs_days
+        if entry_pos >= len(idx):
+            continue
+
+        entry_date = idx[entry_pos]
+        y_t = master.iloc[entry_pos]["BOX_bps"]
+        x_t = master.iloc[entry_pos]["SPREAD_bps"]
+        if pd.isna(y_t) or pd.isna(x_t):
+            continue
+
+        alpha = master.loc[t0, a_col]
+        beta  = master.loc[t0, b_col]
+        r2    = master.loc[t0, r_col]
+
+        y_hat = alpha + beta * x_t
+        resid = y_t - y_hat
+
+        if (abs(resid) < resid_threshold) or (r2 < r2_entry_threshold):
+            continue
+
+        side = +1 if resid > 0 else -1
+        entry_box = float(y_t)
+
+        exit_pos = min(entry_pos + hold_days, len(idx)-1)
+        path = master.iloc[entry_pos+1: exit_pos+1]["BOX_bps"]
+        if len(path) == 0:
+            exit_date = entry_date; exit_box = entry_box; reason = "TIME"
+        else:
+            delta = path - entry_box
+            tp = tp_mult * resid_threshold
+            sl = sl_mult * resid_threshold
+            exit_date, reason = _first_cross(delta, tp, sl, side)
+            exit_box = float(master.loc[exit_date, "BOX_bps"])
+
+        pnl = -side * (exit_box - entry_box) * dv01_k
+        trades.append({
+            "Entry": entry_date, "Exit": exit_date,
+            "Side": "LONG_BOX" if side==+1 else "SHORT_BOX",
+            "EntryBox": entry_box, "Predicted": float(y_hat), "Residual": float(resid),
+            "Beta": float(beta), "R2": float(r2),
+            "Reason": reason, "ExitBox": exit_box, "PnL": float(pnl),
+        })
+
+    trades_df = pd.DataFrame(trades)
+    if trades_df.empty:
+        return trades_df, pd.DataFrame()
+
+    trades_df = trades_df.sort_values("Exit").reset_index(drop=True)
+    trades_df["RealizedCumPnL"] = trades_df["PnL"].cumsum()
+
+    # MtM cumulé
+    start_all = trades_df["Entry"].min()
+    end_all   = trades_df["Exit"].max()
+    dates = master.loc[(master.index >= start_all) & (master.index <= end_all)].index
+
+    pnl_tracker = pd.DataFrame(index=dates)
+    for i, row in trades_df.iterrows():
+        entry = row["Entry"]; exit_ = row["Exit"]
+        side  = +1 if row["Side"] == "LONG_BOX" else -1
+        entry_box = row["EntryBox"]
+
+        ser = pd.Series(0.0, index=dates)
+        in_window = (ser.index > entry) & (ser.index <= exit_)
+        if in_window.any():
+            box_slice = master.loc[in_window, "BOX_bps"]
+            ser.loc[in_window] = -side * (box_slice - entry_box) * dv01_k
+        after_exit = ser.index > exit_
+        if after_exit.any():
+            ser.loc[after_exit] = ser.loc[ser.index == exit_].iloc[0]
+        pnl_tracker[f"Trade_{i+1}"] = ser
+
+    pnl_tracker["CumPnL"] = pnl_tracker.sum(axis=1)
+    return trades_df, pnl_tracker
+
+
+# =========================================================
+# ==================== Figures (Plotly) ===================
+# =========================================================
+def fig_ts(master: pd.DataFrame, col: str, title: str) -> go.Figure:
+    s = master[col].dropna()
+    fig = go.Figure()
+    if not s.empty:
+        fig.add_trace(go.Scatter(x=s.index, y=s.values, mode="lines", name=col))
+    fig.update_layout(title=title, template="plotly_white",
+                      margin=dict(l=40,r=20,t=60,b=40),
+                      xaxis=dict(showgrid=True), yaxis=dict(showgrid=True))
+    return fig
+
+def figs_timeseries_pair(master: pd.DataFrame, r2_col: str, beta_col: str, title_prefix: str) -> Tuple[go.Figure, go.Figure]:
+    """Retourne (fig_R2, fig_Beta) avec titres sur la même ligne dans le layout."""
+    return (
+        fig_ts(master, r2_col,   f"{title_prefix} — R²"),
+        fig_ts(master, beta_col, f"{title_prefix} — Beta"),
+    )
+
+def fig_beta_vs_level_heatmap(master: pd.DataFrame,
+                              beta_col: str,
+                              level_col: str,
+                              title: str,
+                              r2_col: str = None,
+                              r2_min: float = None,
+                              nbinsx: int = 60,
+                              nbinsy: int = 60) -> go.Figure:
+    """
+    Heatmap 2D (Histogram2d) de Beta (Y) vs Niveau (X).
+    - Si r2_col & r2_min fournis, filtre préalablement.
+    """
+    df = master[[beta_col, level_col]].dropna().copy()
+    if r2_col and r2_min is not None and r2_col in master.columns:
+        mask = master[r2_col] >= float(r2_min)
+        df = df.loc[mask.reindex(df.index, fill_value=False)]
+    fig = go.Figure()
+    if not df.empty:
+        fig.add_trace(go.Histogram2d(
+            x=df[level_col].values,
+            y=df[beta_col].values,
+            nbinsx=nbinsx, nbinsy=nbinsy,
+            colorscale="Viridis", colorbar=dict(title="count")
+        ))
+    fig.update_layout(
+        title=title,
+        template="plotly_white",
+        xaxis=dict(title=level_col, showgrid=True),
+        yaxis=dict(title="Beta", showgrid=True),
+        margin=dict(l=50,r=30,t=60,b=50)
+    )
+    return fig
+
+def fig_cum_realized(trades_df: pd.DataFrame, title: str) -> go.Figure:
+    fig = go.Figure()
+    if not trades_df.empty:
+        fig.add_trace(go.Scatter(x=trades_df["Exit"], y=trades_df["RealizedCumPnL"],
+                                 mode="lines", name="Realized CumPnL (k€)"))
+    fig.update_layout(title=title, template="plotly_white",
+                      margin=dict(l=40,r=20,t=60,b=40),
+                      xaxis=dict(showgrid=True), yaxis=dict(showgrid=True))
+    return fig
+
+def fig_cum_mtm(pnl_tracker: pd.DataFrame, title: str) -> go.Figure:
+    fig = go.Figure()
+    if not pnl_tracker.empty:
+        fig.add_trace(go.Scatter(x=pnl_tracker.index, y=pnl_tracker["CumPnL"],
+                                 mode="lines", name="MtM CumPnL (k€)"))
+    fig.update_layout(title=title, template="plotly_white",
+                      margin=dict(l=40,r=20,t=60,b=40),
+                      xaxis=dict(showgrid=True), yaxis=dict(showgrid=True))
+    return fig
+
+
+# =========================================================
+# ========================= Dash UI =======================
+# =========================================================
+app: Dash = dash.Dash(__name__)
+app.title = "BOX Quad Dashboard"
+
+app.layout = html.Div([
+    html.H2("📊 BOX Dashboard (Dash) — 4 sections"),
+    html.Div(id="data-warning", style={"color": "crimson", "marginBottom": "10px"}),
+
+    # ---------------- Controls ----------------
+    html.Div([
+        html.Div([
+            html.Label("Country (high side)"),
+            dcc.Dropdown(id="country", options=[{"label": c, "value": c} for c in DEFAULT_COUNTRIES],
+                         value="Italy", clearable=False),
+
+            html.Label("Long maturity"),
+            dcc.Dropdown(id="matu-long", options=[], value=None, clearable=False),
+
+            html.Label("Short maturity"),
+            dcc.Dropdown(id="matu-short", options=[], value=None, clearable=False),
+
+            html.Br(),
+            html.Label("Rolling / Train window (obs)"),
+            dcc.RadioItems(id="roll-window", options=[{"label": str(w), "value": w} for w in ALL_WINDOWS],
+                           value=126, inline=True),
+
+            html.Label("Observation period (obs)"),
+            dcc.RadioItems(id="obs-days", options=[{"label": str(x), "value": x} for x in OBS_CHOICES],
+                           value=21, inline=True),
+
+            html.Label("Holding period (obs)"),
+            dcc.RadioItems(id="hold-days", options=[{"label": str(x), "value": x} for x in HOLD_CHOICES],
+                           value=21, inline=True),
+
+            html.Br(),
+            html.Label("R² threshold (for HEATMAP filtering only)"),
+            dcc.Slider(id="r2-plot-thr", min=0.0, max=1.0, step=0.05, value=0.30,
+                       marks={i/20: f"{i/20:.2f}" for i in range(0,21)}),
+
+            html.Label("R² threshold (for BACKTEST)"),
+            dcc.Slider(id="r2-bt-thr", min=0.0, max=1.0, step=0.05, value=0.30,
+                       marks={i/20: f"{i/20:.2f}" for i in range(0,21)}),
+
+            html.Label("|epsilon| threshold (bps)"),
+            dcc.Slider(id="eps-thr", min=0.0, max=5.0, step=0.1, value=2.0,
+                       marks={i/2: f"{i/2:.1f}" for i in range(0,11)}),
+
+            html.Label("TP multiple (× epsilon)"),
+            dcc.Slider(id="tp-mult", min=0.0, max=1.0, step=0.05, value=0.50,
+                       marks={i/20: f"{i/20:.2f}" for i in range(0,21)}),
+
+            html.Label("SL multiple (× epsilon)"),
+            dcc.Slider(id="sl-mult", min=0.0, max=1.0, step=0.05, value=0.50,
+                       marks={i/20: f"{i/20:.2f}" for i in range(0,21)}),
+
+            html.Br(),
+            html.Div(id="choice-summary", style={"fontStyle": "italic", "color":"#333"}),
+        ], style={"width":"25%", "display":"inline-block", "verticalAlign":"top", "paddingRight":"18px"}),
+
+        # ---------------- Section 1 ----------------
+        html.Div([
+            html.H3("1) Regression of Box Level vs Spread Level"),
+            html.Div([
+                dcc.Graph(id="fig1-r2",   config={"displaylogo": False}, style={"width":"49%", "display":"inline-block"}),
+                dcc.Graph(id="fig1-beta", config={"displaylogo": False}, style={"width":"49%", "display":"inline-block"}),
+            ]),
+            dcc.Graph(id="fig1-resid", config={"displaylogo": False}),
+            dcc.Graph(id="fig1-heatmap-all",   config={"displaylogo": False}),
+            dcc.Graph(id="fig1-heatmap-filt",  config={"displaylogo": False}),
+        ], style={"width":"74%", "display":"inline-block", "verticalAlign":"top"}),
+    ]),
+
+    html.Hr(),
+
+    # ---------------- Section 2 ----------------
+    html.Div([
+        html.H3("2) Regression of Box Level vs Curve Level (Germany)"),
+        html.Div([
+            dcc.Graph(id="fig2-r2",   config={"displaylogo": False}, style={"width":"49%", "display":"inline-block"}),
+            dcc.Graph(id="fig2-beta", config={"displaylogo": False}, style={"width":"49%", "display":"inline-block"}),
+        ]),
+        dcc.Graph(id="fig2-resid", config={"displaylogo": False}),
+        dcc.Graph(id="fig2-heatmap-all",  config={"displaylogo": False}),
+        dcc.Graph(id="fig2-heatmap-filt", config={"displaylogo": False}),
+    ]),
+
+    html.Hr(),
+
+    # ---------------- Section 3 ----------------
+    html.Div([
+        html.H3("3) Regression of Daily Box Changes vs Daily Spread Changes"),
+        html.Div([
+            dcc.Graph(id="fig3-r2",   config={"displaylogo": False}, style={"width":"49%", "display":"inline-block"}),
+            dcc.Graph(id="fig3-beta", config={"displaylogo": False}, style={"width":"49%", "display":"inline-block"}),
+        ]),
+        dcc.Graph(id="fig3-resid", config={"displaylogo": False}),
+        dcc.Graph(id="fig3-heatmap-all",  config={"displaylogo": False}),
+        dcc.Graph(id="fig3-heatmap-filt", config={"displaylogo": False}),
+    ]),
+
+    html.Hr(),
+
+    # ---------------- Section 4 ----------------
+    html.Div([
+        html.H3("4) Backtest (Levels vs Spread)"),
+        html.Div([
+            dcc.Graph(id="fig-bt-realized", config={"displaylogo": False}, style={"width":"49%", "display":"inline-block"}),
+            dcc.Graph(id="fig-bt-mtm",      config={"displaylogo": False}, style={"width":"49%", "display":"inline-block"}),
+        ]),
+        html.H4("Trades (head)"),
+        html.Div(id="trades-head"),
+    ]),
+], style={"maxWidth":"1400px", "margin":"0 auto"})
+
+
+# =========================================================
+# ================ Callbacks: maturities ==================
+# =========================================================
+@callback(
+    Output("data-warning", "children"),
+    Output("matu-long", "options"),
+    Output("matu-short", "options"),
+    Output("matu-long", "value"),
+    Output("matu-short", "value"),
+    Input("country", "value"),
+)
+def populate_maturities(country):
+    if data is None:
+        return ("No `data` DataFrame found. Provide it globally or via data_loader.py",
+                [], [], None, None)
+    mats = maturities_for_country(data, country)
+    opts = [{"label": m, "value": m} for m in mats]
+    defL = "10Y" if "10Y" in mats else (mats[-1] if mats else None)
+    defS = "5Y"  if "5Y"  in mats else (mats[0]  if mats else None)
+    return "", opts, opts, defL, defS
+
+
+# =========================================================
+# ================ Callback principal (compute) ============
+# =========================================================
+@callback(
+    Output("choice-summary", "children"),
+
+    # Section 1
+    Output("fig1-r2", "figure"),
+    Output("fig1-beta", "figure"),
+    Output("fig1-resid", "figure"),
+    Output("fig1-heatmap-all",  "figure"),
+    Output("fig1-heatmap-filt", "figure"),
+
+    # Section 2
+    Output("fig2-r2", "figure"),
+    Output("fig2-beta", "figure"),
+    Output("fig2-resid", "figure"),
+    Output("fig2-heatmap-all",  "figure"),
+    Output("fig2-heatmap-filt", "figure"),
+
+    # Section 3
+    Output("fig3-r2", "figure"),
+    Output("fig3-beta", "figure"),
+    Output("fig3-resid", "figure"),
+    Output("fig3-heatmap-all",  "figure"),
+    Output("fig3-heatmap-filt", "figure"),
+
+    # Section 4 (backtest)
+    Output("fig-bt-realized", "figure"),
+    Output("fig-bt-mtm", "figure"),
+    Output("trades-head", "children"),
+
+    Input("country", "value"),
+    Input("matu-long", "value"),
+    Input("matu-short", "value"),
+    Input("roll-window", "value"),
+    Input("obs-days", "value"),
+    Input("hold-days", "value"),
+    Input("r2-plot-thr", "value"),
+    Input("r2-bt-thr", "value"),
+    Input("eps-thr", "value"),
+    Input("tp-mult", "value"),
+    Input("sl-mult", "value"),
+)
+def update_all(country, mL, mS, W, obs_days, hold_days, r2_plot_thr, r2_bt_thr, eps_thr, tp_mult, sl_mult):
+    empty = go.Figure()
+    if data is None:
+        return ("No `data` provided.", *([empty]*18), "")
+    if not (country and mL and mS):
+        return ("Select country and both maturities.", *([empty]*18), "")
+
+    # 1) MASTER (en bps, avec toutes les rolling OLS pour 63/126/252)
+    try:
+        master = build_master_dataframe(data, country, BENCHMARK, mL, mS, windows=ALL_WINDOWS)
+    except Exception as e:
+        return (f"Error while building series: {e}", *([empty]*18), "")
+
+    summary = f"BOX = ({country} {mL} - {BENCHMARK} {mL}) - ({country} {mS} - {BENCHMARK} {mS}) [bps]"
+
+    # ---------- Section 1: Levels BOX ~ SPREAD ----------
+    r2_1 = f"lvl_spread_r2_w{W}"
+    b_1  = f"lvl_spread_beta_w{W}"
+    e_1  = f"lvl_spread_resid_w{W}"
+
+    fig1_r2, fig1_beta = figs_timeseries_pair(
+        master, r2_1, b_1, f"[1] BOX~SPREAD (Levels) — {country} {mS}s{mL}"
+    )
+    fig1_resid = fig_ts(master, e_1, f"[1] Residual (window end) — BOX~SPREAD (Levels)")
+    # Heatmaps: Beta vs Spread level
+    fig1_heat_all  = fig_beta_vs_level_heatmap(master, beta_col=b_1, level_col="SPREAD_bps",
+                                               title="[1] Beta vs Spread level — ALL")
+    fig1_heat_filt = fig_beta_vs_level_heatmap(master, beta_col=b_1, level_col="SPREAD_bps",
+                                               r2_col=r2_1, r2_min=r2_plot_thr,
+                                               title=f"[1] Beta vs Spread level — R² ≥ {r2_plot_thr:.2f}")
+
+    # ---------- Section 2: Levels BOX ~ CURVE (Germany) ----------
+    r2_2 = f"lvl_curve_r2_w{W}"
+    b_2  = f"lvl_curve_beta_w{W}"
+    e_2  = f"lvl_curve_resid_w{W}"
+
+    fig2_r2, fig2_beta = figs_timeseries_pair(
+        master, r2_2, b_2, f"[2] BOX~CURVE (Levels, {BENCHMARK} {mS}s{mL})"
+    )
+    fig2_resid = fig_ts(master, e_2, f"[2] Residual (window end) — BOX~CURVE (Levels)")
+    fig2_heat_all  = fig_beta_vs_level_heatmap(master, beta_col=b_2, level_col="CURVE_bps",
+                                               title="[2] Beta vs Curve level — ALL")
+    fig2_heat_filt = fig_beta_vs_level_heatmap(master, beta_col=b_2, level_col="CURVE_bps",
+                                               r2_col=r2_2, r2_min=r2_plot_thr,
+                                               title=f"[2] Beta vs Curve level — R² ≥ {r2_plot_thr:.2f}")
+
+    # ---------- Section 3: Daily ΔBOX ~ ΔSPREAD ----------
+    r2_3 = f"chg_spread_r2_w{W}"
+    b_3  = f"chg_spread_beta_w{W}"
+    e_3  = f"chg_spread_resid_w{W}"
+
+    fig3_r2, fig3_beta = figs_timeseries_pair(
+        master, r2_3, b_3, f"[3] ΔBOX~ΔSPREAD (Daily changes)"
+    )
+    fig3_resid = fig_ts(master, e_3, f"[3] Residual (window end) — ΔBOX~ΔSPREAD")
+    # Heatmaps: (même si régression sur Δ, on trace Beta vs **niveau** du spread)
+    fig3_heat_all  = fig_beta_vs_level_heatmap(master, beta_col=b_3, level_col="SPREAD_bps",
+                                               title="[3] Beta (Δ model) vs Spread level — ALL")
+    fig3_heat_filt = fig_beta_vs_level_heatmap(master, beta_col=b_3, level_col="SPREAD_bps",
+                                               r2_col=r2_3, r2_min=r2_plot_thr,
+                                               title=f"[3] Beta (Δ model) vs Spread level — R² ≥ {r2_plot_thr:.2f}")
+
+    # ---------- Section 4: Backtest (Levels vs SPREAD) ----------
+    trades_df, pnl_tracker = run_backtest_from_master(
+        master, window=W, obs_days=obs_days, hold_days=hold_days,
+        resid_threshold=eps_thr, r2_entry_threshold=r2_bt_thr,
+        tp_mult=tp_mult, sl_mult=sl_mult, dv01_k=10.0
+    )
+    fig_real = fig_cum_realized(trades_df, f"[4] Realized Cum PnL (k€) — W={W}, Obs={obs_days}, Hold={hold_days}")
+    fig_mtm  = fig_cum_mtm(pnl_tracker, "[4] Portfolio MtM Cum PnL (k€)")
+
+    # Aperçu trades
+    if trades_df.empty:
+        trades_preview = html.Div("No trades with current thresholds.", style={"color":"#444"})
+    else:
+        head = trades_df.head(12).copy()
+        head["Entry"] = pd.to_datetime(head["Entry"]).dt.strftime("%Y-%m-%d")
+        head["Exit"]  = pd.to_datetime(head["Exit"]).dt.strftime("%Y-%m-%d")
+        trades_preview = html.Table([
+            html.Thead(html.Tr([html.Th(c) for c in head.columns])),
+            html.Tbody([html.Tr([html.Td(head.iloc[i][c]) for c in head.columns]) for i in range(len(head))])
+        ], style={"width":"100%","fontSize":"12px","overflowX":"auto"})
+
+    return (summary,
+            # Sec1
+            fig1_r2, fig1_beta, fig1_resid, fig1_heat_all, fig1_heat_filt,
+            # Sec2
+            fig2_r2, fig2_beta, fig2_resid, fig2_heat_all, fig2_heat_filt,
+            # Sec3
+            fig3_r2, fig3_beta, fig3_resid, fig3_heat_all, fig3_heat_filt,
+            # Sec4
+            fig_real, fig_mtm, trades_preview)
+
+
+# =========================================================
+# ====================== Run serveur ======================
+# =========================================================
+if __name__ == "__main__":
+    host = "0.0.0.0"; port = 8050
+
+    def get_local_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = "127.0.0.1"
+        finally:
+            s.close()
+        return ip
+
+    local_ip = get_local_ip()
+    print("\n================= SHARE THIS =================")
+    print(f"Local (toi)    : http://localhost:{port}")
+    print(f"Réseau (équipe): http://{local_ip}:{port}")
+    print("================================================\n")
+
+    app.run_server(host=host, port=port, debug=False)
