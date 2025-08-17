@@ -20,23 +20,23 @@ MATU_LONG  = "10Y"           # maturité longue (ex: 10Y)
 MATU_SHORT = "5Y"            # maturité courte (ex: 5Y)
 MATU_SPREAD = "10Y"          # maturité du spread pour la régression (ex: 10Y)
 
-# Fenêtres pour l’analyse (rolling regressions sur niveaux)
-ROLLING_WINDOW_DAYS = 63     # taille de la fenêtre glissante pour l’analyse (ex: 63j ~ 3 mois)
-MIN_OBS_IN_WINDOW   = 63     # garde-fou: n’affiche que si la fenêtre est pleine
+# Fenêtres pour l’analyse (rolling regressions)
+ROLLING_WINDOW_DAYS = 63     # taille de la fenêtre glissante (≈ 3 mois)
+MIN_OBS_IN_WINDOW   = 63     # on exige une fenêtre pleine
 
-# Fenêtres pour le backtest (TOUT EN JOURS, business simplifié)
-TRAIN_WINDOW_DAYS = 126      # fenêtre d’entraînement (ex: 126j ~ 6 mois)
-OBS_WINDOW_DAYS   = 21       # fenêtre d’observation / cooldown (ex: 21j ~ 1 mois)
-HOLDING_DAYS      = 21       # durée max de détention d’un trade (ex: 21j)
+# Fenêtres pour le backtest (INTERPRÉTÉES COMME NOMBRE D'OBSERVATIONS)
+TRAIN_WINDOW_DAYS = 126      # 6 mois ≈ 126 obs
+OBS_WINDOW_DAYS   = 21       # 1 mois ≈ 21 obs entre fin training et jour d’entrée
+HOLDING_DAYS      = 21       # 1 mois max de détention ≈ 21 obs
 
 # Seuils & notionnel
-RESID_THRESHOLD     = 2.0    # seuil sur |epsilon_t| pour déclencher une entrée
-R2_ENTRY_THRESHOLD  = 0.30   # on n’entre que si R² du modèle >= ce seuil
-TP_MULT             = 0.5    # take profit = TP_MULT * RESID_THRESHOLD (en pts de BOX)
-SL_MULT             = 0.5    # stop loss   = SL_MULT * RESID_THRESHOLD (en pts de BOX)
-DV01_K              = 10.0   # DV01 notionnel en milliers d’€, 10 => 10k€
+RESID_THRESHOLD     = 2.0    # seuil |epsilon| pour déclencher un trade
+R2_ENTRY_THRESHOLD  = 0.30   # filtre R² minimum
+TP_MULT             = 0.5    # TP = 0.5 * threshold (en pts de BOX)
+SL_MULT             = 0.5    # SL = 0.5 * threshold
+DV01_K              = 10.0   # 10 => 10k€ de DV01 notionnel
 
-# Driver utilisé pour le signal pendant le backtest (niveaux uniquement)
+# Driver utilisé pour le backtest (sur niveaux)
 DRIVER_FOR_SIGNAL   = "SPREAD"  # "SPREAD" ou "CURVE"
 
 
@@ -44,22 +44,7 @@ DRIVER_FOR_SIGNAL   = "SPREAD"  # "SPREAD" ou "CURVE"
 # Helper pour les noms de colonnes
 # =========================
 def col(country: str, matu: str) -> str:
-    """
-    BUT
-    ----
-    Normaliser la construction des noms de colonnes à partir du pays et de la maturité.
-
-    PARAMÈTRES
-    ----------
-    country : str
-        Nom du pays (ex: "Italy", "Germany").
-    matu : str
-        Maturité (ex: "10Y", "5Y").
-
-    RETOUR
-    ------
-    str : nom de colonne attendu dans `data` (ex: "Italy 10Y").
-    """
+    """Construit un nom de colonne standard 'Country Maturity' (ex: 'Italy 10Y')."""
     return f"{country} {matu}"
 
 
@@ -72,193 +57,90 @@ def build_series(data: pd.DataFrame,
                  matu_spread: str,
                  curve_country: str) -> pd.DataFrame:
     """
-    BUT
-    ----
-    Construire les trois séries structurantes de l’analyse et du backtest à partir de `data`.
-
-    DÉFINITIONS
-    -----------
-    - BOX    = (High_long - Low_long) - (High_short - Low_short)
-               -> “boîte” entre pays: pente relative long/short entre High et Low.
-    - SPREAD = High_matu_spread - Low_matu_spread
-               -> écart de niveau à une maturité donnée entre les deux pays.
-    - CURVE  = (curve_country long - curve_country short)
-               -> pente de la courbe (long - short) d’un pays benchmark.
-
-    ATTENDUS SUR `data`
-    -------------------
-    `data` possède des colonnes nommées "Country Matu" (ex: "Italy 10Y", "Germany 5Y")
-    et un index de dates (type datetime, trié).
-
-    PARAMÈTRES
-    ----------
-    data : pd.DataFrame
-        Taux (niveaux) par pays et maturité.
-    country_high, country_low : str
-        Paires de pays (ex: "Italy", "Germany").
-    matu_long, matu_short, matu_spread : str
-        Maturités utilisées (ex: "10Y", "5Y" ...).
-    curve_country : str
-        Pays utilisé pour la courbe.
-
-    RETOUR
-    ------
-    pd.DataFrame : colonnes ["BOX", "SPREAD", "CURVE"], index = dates, sans NaN.
+    Construit 3 séries structurantes (index daté trié attendu) :
+      BOX    = (High_long - Low_long) - (High_short - Low_short)
+      SPREAD = High_matu_spread - Low_matu_spread
+      CURVE  = (curve_country long - curve_country short)
     """
-    # Extraire les séries nécessaires
     s_high_long  = data[col(country_high,  matu_long )]
     s_low_long   = data[col(country_low,   matu_long )]
     s_high_short = data[col(country_high,  matu_short)]
     s_low_short  = data[col(country_low,   matu_short)]
 
-    # Construire les 3 séries
     box    = (s_high_long - s_low_long) - (s_high_short - s_low_short)
     spread = data[col(country_high, matu_spread)] - data[col(country_low, matu_spread)]
     curve  = data[col(curve_country, matu_long)] - data[col(curve_country, matu_short)]
 
-    # Assemblage final
     out = pd.DataFrame({"BOX": box, "SPREAD": spread, "CURVE": curve}).dropna()
     return out
 
 
 # =========================
-# Rolling regression (analyse sur NIVEAUX)
+# Rolling regression (générique, sur NIVEAUX OU Δ)
 # =========================
 def rolling_regression(y: pd.Series, x: pd.Series, window: int, min_obs: int = 63) -> pd.DataFrame:
     """
-    BUT
-    ----
-    Estimer une régression OLS **glissante** (niveaux) sur des fenêtres de taille fixe.
-
-    MODÈLE PAR FENÊTRE
-    ------------------
-    y = α + β * x + ε, avec:
-      - y : BOX (niveaux)
-      - x : driver (SPREAD ou CURVE)
-      - α : constante, β : sensibilité de la BOX au driver.
-
-    POUR CHAQUE FENÊTRE
-    -------------------
-      - on stocke:
-          * Beta  : β
-          * R2    : R² du modèle sur la fenêtre
-          * T_stat: t-stat de β
-          * Residual: résiduel **au dernier point** de la fenêtre (y_T - ŷ_T)
-            (utile pour visualiser la déviation courante de la BOX vs la valeur expliquée)
-
-    PARAMÈTRES
-    ----------
-    y : pd.Series
-        Série de la BOX en niveaux (index dates).
-    x : pd.Series
-        Série du driver (SPREAD ou CURVE) en niveaux (index dates).
-    window : int
-        Taille de la fenêtre glissante (en jours).
-    min_obs : int
-        Garde-fou: on exige au moins `min_obs` observations dans la fenêtre.
-
-    RETOUR
-    ------
-    pd.DataFrame : index = date de fin de fenêtre, colonnes ["Beta", "R2", "T_stat", "Residual"].
+    OLS glissante (y ~ const + x) sur fenêtres de taille `window`.
+    Stocke Alpha (constante), Beta, R², T-stat, et le résiduel au dernier point de chaque fenêtre.
     """
-    y = y.dropna()
-    x = x.dropna()
+    y = y.dropna(); x = x.dropna()
     df = pd.concat([y.rename("y"), x.rename("x")], axis=1).dropna()
     res = []
-
     if len(df) < window:
-        return pd.DataFrame(columns=["Beta","R2","T_stat","Residual"])
+        return pd.DataFrame(columns=["Alpha","Beta","R2","T_stat","Residual"])
 
     for end in range(window, len(df)+1):
-        window_df = df.iloc[end-window:end]
-        if window_df.shape[0] < min_obs:
+        w = df.iloc[end-window:end]
+        if w.shape[0] < min_obs:
             continue
+        X = sm.add_constant(w["x"].values)
+        model = sm.OLS(w["y"].values, X).fit()
 
-        # OLS (y ~ const + x)
-        X = sm.add_constant(window_df["x"].values)
-        model = sm.OLS(window_df["y"].values, X).fit()
-
-        # Résiduel sur le dernier point de la fenêtre
-        last_y = window_df["y"].iloc[-1]
-        last_x = window_df["x"].iloc[-1]
+        last_y = w["y"].iloc[-1]
+        last_x = w["x"].iloc[-1]
         y_hat_last = model.params[0] + model.params[1]*last_x
-        resid_last = last_y - y_hat_last
 
         res.append({
-            "Date": window_df.index[-1],
+            "Date": w.index[-1],
+            "Alpha": float(model.params[0]),
             "Beta":  float(model.params[1]),
             "R2":    float(model.rsquared),
             "T_stat": float(model.tvalues[1]),
-            "Residual": float(resid_last)
+            "Residual": float(last_y - y_hat_last)  # résidu au point de fin de fenêtre
         })
-
-    out = pd.DataFrame(res).set_index("Date")
-    return out
+    return pd.DataFrame(res).set_index("Date")
 
 
 # =========================
-# Plots (analyse)
+# Plots (analyse) — suptitle global, sous-titres concis
 # =========================
 def plot_regression_results(df: pd.DataFrame, title_prefix: str):
-    """
-    BUT
-    ----
-    Tracer **4 séries temporelles** issues d’une rolling regression:
-      - R²    : pouvoir explicatif
-      - Beta  : sensibilité de la BOX au driver
-      - T-stat: robustesse statistique de Beta
-      - Residual (fin de fenêtre): y_T - ŷ_T
-
-    PARAMÈTRES
-    ----------
-    df : pd.DataFrame
-        Résultats de `rolling_regression` (index = dates).
-    title_prefix : str
-        Préfixe du titre (pour contextualiser pays/maturités/driver).
-    """
+    """Affiche 4 sous-graphiques (R², Beta, T-stat, Residual) avec un SEUL titre global."""
+    if df.empty:
+        print(f"[plot_regression_results] Aucun résultat pour: {title_prefix}")
+        return
     fig, axes = plt.subplots(2, 2, figsize=(24, 12))
-    fig.suptitle(f"{title_prefix}", fontsize=16)
-    fig.tight_layout(pad=2.0)
+    fig.suptitle(title_prefix, fontsize=18, fontweight="bold", y=0.98)
 
-    axes[0,0].plot(df.index, df["R2"], label="R²");       axes[0,0].set_title(f"{title_prefix} - R²"); axes[0,0].legend(); axes[0,0].grid(True)
-    axes[0,1].plot(df.index, df["Beta"], label="Beta");    axes[0,1].set_title(f"{title_prefix} - Beta"); axes[0,1].legend(); axes[0,1].grid(True)
-    axes[1,0].plot(df.index, df["T_stat"], label="T-stat");axes[1,0].set_title(f"{title_prefix} - T-stat"); axes[1,0].legend(); axes[1,0].grid(True)
-    axes[1,1].plot(df.index, df["Residual"], label="Residual"); axes[1,1].set_title(f"{title_prefix} - Residual (window end)"); axes[1,1].legend(); axes[1,1].grid(True)
+    axes[0,0].plot(df.index, df["R2"], label="R²");        axes[0,0].set_title("R²"); axes[0,0].legend(); axes[0,0].grid(True)
+    axes[0,1].plot(df.index, df["Beta"], label="Beta");     axes[0,1].set_title("Beta"); axes[0,1].legend(); axes[0,1].grid(True)
+    axes[1,0].plot(df.index, df["T_stat"], label="T-stat"); axes[1,0].set_title("T-stat"); axes[1,0].legend(); axes[1,0].grid(True)
+    axes[1,1].plot(df.index, df["Residual"], label="Residual (window end)"); axes[1,1].set_title("Residual (window end)"); axes[1,1].legend(); axes[1,1].grid(True)
 
     for ax in axes.flat:
-        ax.xaxis.set_major_locator(mdates.YearLocator())
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        ax.xaxis.set_major_locator(mdates.YearLocator()); ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
         plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
-
-    plt.show()
+    plt.tight_layout(rect=[0, 0, 1, 0.95]); plt.show()
 
 
 def plot_scatter_beta(df_results: pd.DataFrame, series_level: pd.Series, x_label: str, title: str):
-    """
-    BUT
-    ----
-    Visualiser la relation **Beta vs Niveau** (Spread ou Curve) sur l’échantillon,
-    avec une coloration par année pour repérer d’éventuels régimes.
-
-    PARAMÈTRES
-    ----------
-    df_results : pd.DataFrame
-        Résultats de `rolling_regression` (doit contenir la colonne "Beta").
-    series_level : pd.Series
-        Niveaux du driver (SPREAD ou CURVE) alignés sur le temps.
-    x_label : str
-        Label de l’axe X (ex: "Spread Level").
-    title : str
-        Titre du graphique.
-    """
+    """Scatter Beta (y) vs Niveau (x = Spread/Curve ou ΔSpread/ΔCurve), coloré par année."""
     common_idx = df_results.index.intersection(series_level.index)
-    x = series_level.reindex(common_idx)
-    beta = df_results.loc[common_idx, "Beta"]
-
-    years = common_idx.year
-    cmap = cm.get_cmap("coolwarm")
-    norm = Normalize(vmin=years.min(), vmax=years.max())
-
+    if len(common_idx) == 0:
+        print(f"[plot_scatter_beta] Index commun vide pour: {title}")
+        return
+    x = series_level.reindex(common_idx); beta = df_results.loc[common_idx, "Beta"]
+    years = common_idx.year; cmap = cm.get_cmap("coolwarm"); norm = Normalize(vmin=years.min(), vmax=years.max())
     plt.figure(figsize=(10,6))
     plt.scatter(x, beta, c=[cmap(norm(y)) for y in years])
     cbar = plt.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap)); cbar.set_label("Year")
@@ -266,72 +148,59 @@ def plot_scatter_beta(df_results: pd.DataFrame, series_level: pd.Series, x_label
 
 
 # =========================
-# Analyse complète (NIVEAUX seulement)
+# 1) Analyse NIVEAUX (paramétrable, plots optionnels)
 # =========================
-def run_analysis_levels(data: pd.DataFrame):
+def run_analysis_levels(data: pd.DataFrame, window: int = ROLLING_WINDOW_DAYS, do_plots: bool = True):
     """
-    BUT
-    ----
-    Orchestrer l’analyse exploratoire **sur niveaux**:
-      1) Construction des séries BOX / SPREAD / CURVE
-      2) Rolling regressions: BOX ~ SPREAD, BOX ~ CURVE
-      3) Plots: R², Beta, T-stat, Residual + Scatterplots Beta vs Niveau
-
-    PARAMÈTRES
-    ----------
-    data : pd.DataFrame
-        Taux avec colonnes "Country Matu".
-
-    RETOUR
-    ------
-    (series, rr_spread, rr_curve) :
-        - series    : DataFrame avec ["BOX", "SPREAD", "CURVE"]
-        - rr_spread : résultats rolling (BOX~SPREAD)
-        - rr_curve  : résultats rolling (BOX~CURVE)
+    Analyse sur niveaux: rolling BOX~SPREAD et BOX~CURVE + (plots si do_plots) + DataFrames.
+    RETOUR: (series, rr_spread_lvl, rr_curve_lvl)
     """
     series = build_series(data, COUNTRY_HIGH, COUNTRY_LOW, MATU_LONG, MATU_SHORT, MATU_SPREAD, BENCHMARK_CURVE_COUNTRY)
+    rr_spread = rolling_regression(series["BOX"], series["SPREAD"], window, min_obs=window)
+    rr_curve  = rolling_regression(series["BOX"], series["CURVE"],  window, min_obs=window)
 
-    rr_spread = rolling_regression(series["BOX"], series["SPREAD"], ROLLING_WINDOW_DAYS, MIN_OBS_IN_WINDOW)
-    rr_curve  = rolling_regression(series["BOX"], series["CURVE"],  ROLLING_WINDOW_DAYS, MIN_OBS_IN_WINDOW)
-
-    # Tracer les 4 indicateurs + scatterplots (SPREAD et CURVE)
-    plot_regression_results(rr_spread, f"BOX vs SPREAD ({COUNTRY_HIGH}-{COUNTRY_LOW} | {MATU_SHORT}s{MATU_LONG})")
-    plot_regression_results(rr_curve,  f"BOX vs CURVE ({BENCHMARK_CURVE_COUNTRY} {MATU_SHORT}s{MATU_LONG})")
-    plot_scatter_beta(rr_spread, series["SPREAD"], "Spread Level", "Beta vs Spread (colored by year)")
-    plot_scatter_beta(rr_curve,  series["CURVE"],  "Curve Level",  "Beta vs Curve (colored by year)")
+    if do_plots:
+        plot_regression_results(rr_spread, f"BOX vs SPREAD (Levels) — {COUNTRY_HIGH}-{COUNTRY_LOW} | {MATU_SHORT}s{MATU_LONG}")
+        plot_regression_results(rr_curve,  f"BOX vs CURVE  (Levels) — {BENCHMARK_CURVE_COUNTRY} {MATU_SHORT}s{MATU_LONG}")
+        plot_scatter_beta(rr_spread, series["SPREAD"], "Spread Level", "Beta vs Spread (Levels)")
+        plot_scatter_beta(rr_curve,  series["CURVE"],  "Curve Level",  "Beta vs Curve  (Levels)")
 
     return series, rr_spread, rr_curve
 
 
 # =========================
-# BACKTEST — utilitaire de sortie (TP/SL/TIME)
+# 2) Analyse DAILY CHANGES (Δ) — indépendante (paramétrable)
+# =========================
+def run_analysis_daily_changes(data: pd.DataFrame, window: int = ROLLING_WINDOW_DAYS, do_plots: bool = True):
+    """
+    Analyse sur variations quotidiennes:
+      ΔBOX = BOX.diff(), ΔSPREAD = SPREAD.diff(), ΔCURVE = CURVE.diff()
+    Rolling regressions: ΔBOX~ΔSPREAD et ΔBOX~ΔCURVE + (plots si do_plots).
+    RETOUR: (changes_df, rr_spread_chg, rr_curve_chg)
+    """
+    series = build_series(data, COUNTRY_HIGH, COUNTRY_LOW, MATU_LONG, MATU_SHORT, MATU_SPREAD, BENCHMARK_CURVE_COUNTRY)
+    chg = series.diff().dropna().rename(columns={"BOX":"dBOX","SPREAD":"dSPREAD","CURVE":"dCURVE"})
+
+    rr_spread_chg = rolling_regression(chg["dBOX"], chg["dSPREAD"], window, min_obs=window)
+    rr_curve_chg  = rolling_regression(chg["dBOX"], chg["dCURVE"],  window, min_obs=window)
+
+    if do_plots:
+        plot_regression_results(rr_spread_chg, f"ΔBOX vs ΔSPREAD (Daily Changes) — {COUNTRY_HIGH}-{COUNTRY_LOW} | {MATU_SHORT}s{MATU_LONG}")
+        plot_regression_results(rr_curve_chg,  f"ΔBOX vs ΔCURVE  (Daily Changes) — {BENCHMARK_CURVE_COUNTRY} {MATU_SHORT}s{MATU_LONG}")
+        plot_scatter_beta(rr_spread_chg, chg["dSPREAD"], "Daily ΔSpread", "Beta vs ΔSpread (Daily Changes)")
+        plot_scatter_beta(rr_curve_chg,  chg["dCURVE"],  "Daily ΔCurve",  "Beta vs ΔCurve  (Daily Changes)")
+
+    return chg, rr_spread_chg, rr_curve_chg
+
+
+# =========================
+# BACKTEST — utilitaire TP/SL/TIME
 # =========================
 def _first_cross(delta_series: pd.Series, tp: float, sl: float, side: int):
     """
-    BUT
-    ----
-    Déterminer la **première** date où la trajectoire ΔBOX atteint
-    un niveau de **Take Profit** (TP) ou de **Stop Loss** (SL), sinon sortir à la fin ("TIME").
-
-    NOTATION
-    --------
-    - delta_series : série (index dates) des ΔBOX = BOX_t - BOX_entry pour t dans (entry; entry+holding]
-    - side : sens du trade
-        +1  = LONG_BOX (on gagne si la BOX baisse)
-        -1  = SHORT_BOX (on gagne si la BOX monte)
-
-    RÈGLES
-    ------
-    LONG_BOX (side = +1):
-        - TP si ΔBOX <= -tp   (la BOX a baissé de 'tp' points ou plus)
-        - SL si ΔBOX >=  sl   (la BOX a monté de 'sl' points ou plus)
-    SHORT_BOX (side = -1):
-        - TP si ΔBOX >=  tp   (la BOX a monté de 'tp' points ou plus)
-        - SL si ΔBOX <= -sl   (la BOX a baissé de 'sl' points ou plus)
-
-    RETOUR
-    ------
-    (exit_date, reason) : date de sortie et raison ('TP', 'SL', 'TIME').
+    Repère la première date où ΔBOX touche TP/SL selon le sens du trade.
+    LONG (side=+1): TP si Δ<=-tp ; SL si Δ>=+sl
+    SHORT (side=-1): TP si Δ>=+tp ; SL si Δ<=-sl
     """
     for dt, d in delta_series.items():
         if side == +1:
@@ -344,173 +213,138 @@ def _first_cross(delta_series: pd.Series, tp: float, sl: float, side: int):
 
 
 # =========================
-# BACKTEST (régressions sur NIVEAUX avec observation window)
+# 3) BACKTEST À PARTIR DE LA ROLLING REGRESSION (réutilise Alpha/Beta/R² pré-calculés)
 # =========================
-def backtest_strategy_days(data: pd.DataFrame,
-                           train_window_days=TRAIN_WINDOW_DAYS,
-                           obs_window_days=OBS_WINDOW_DAYS,
-                           holding_days=HOLDING_DAYS,
-                           resid_threshold=RESID_THRESHOLD,
-                           r2_entry_threshold=R2_ENTRY_THRESHOLD,
-                           tp_mult=TP_MULT,
-                           sl_mult=SL_MULT,
-                           dv01_k=DV01_K,
-                           driver=DRIVER_FOR_SIGNAL):
+def backtest_from_rr(series: pd.DataFrame,
+                      rr_results: pd.DataFrame,
+                      driver: str = "SPREAD",
+                      obs_window_days: int = OBS_WINDOW_DAYS,
+                      holding_days: int = HOLDING_DAYS,
+                      resid_threshold: float = RESID_THRESHOLD,
+                      r2_entry_threshold: float = R2_ENTRY_THRESHOLD,
+                      tp_mult: float = TP_MULT,
+                      sl_mult: float = SL_MULT,
+                      dv01_k: float = DV01_K):
     """
-    BUT
-    ----
-    Implémenter la stratégie de trading basée sur le résiduel d’une OLS glissante sur **niveaux**,
-    avec une **fenêtre d’observation** entre la fin de l’entraînement et la date de décision t.
-
-    PIPELINE À CHAQUE DATE t
-    ------------------------
-    1) Training window "pure past" : [t - obs_window - train_window, t - obs_window)
-       - Estimer y = α + β x + ε (avec y=BOX, x=driver=SPREAD ou CURVE)
-       - Récupérer α̂, β̂, R²
-    2) Signal à t :
-       - ŷ_t = α̂ + β̂ * x_t
-       - ε_t  = y_t - ŷ_t
-    3) Entrée si:
-       - |ε_t| >= resid_threshold  **et**  R² >= r2_entry_threshold
-       - ε_t > 0  -> LONG_BOX (on joue un flatten : on gagne si BOX baisse)
-       - ε_t < 0  -> SHORT_BOX (on joue un steepen : on gagne si BOX monte)
-    4) Gestion de la position sur (t; t+holding_days]:
-       - Définition ΔBOX = BOX_d - BOX_entry
-       - TP / SL en multiples du seuil via `_first_cross`
-       - Sinon "TIME" (sortie au dernier jour)
-    5) PnL réalisé :
-       - PnL = -side * (BOX_exit - BOX_entry) * dv01_k
-         (side = +1 long -> gagne si BOX↓ ; side = -1 short -> gagne si BOX↑)
-
-    SORTIES
-    -------
-    trades_df : un trade par ligne (Entry, Exit, Side, EntryBox, Predicted, Residual, Beta, R2, Reason, ExitBox, PnL)
-                + RealizedCumPnL (cumsum des PnL triés par date de sortie)
-    pnl_tracker : DataFrame indexée par dates (de la 1ère entrée à la dernière sortie)
-                  colonnes Trade_1..Trade_N: PnL mark-to-market par trade (0 le jour d’entrée,
-                  M2M jusqu’à la sortie, puis valeur figée) + colonne CumPnL (somme par ligne = portefeuille)
+    Stratégie basée sur la **rolling regression pré-calculée** (fenêtre de TRAIN obs).
+    Pour chaque fin de fenêtre d'entraînement t0 (index de rr_results):
+      - Entrée candidate à t = t0 + OBS_WINDOW_DAYS (en nombre d'observations),
+        en utilisant Alpha(t0), Beta(t0) et R2(t0).
+      - ŷ_t = Alpha(t0) + Beta(t0) * X_t  avec X_t = series[driver] au jour t
+      - ε_t  = BOX_t - ŷ_t
+      - Entrée si |ε_t| >= resid_threshold et R²(t0) >= r2_entry_threshold
+      - Sortie via TP/SL ou TIME sur les HOLDING_DAYS obs suivantes.
+      - PnL = -side * (BOX_exit - BOX_entry) * dv01_k
+    RETOUR:
+      trades_df, pnl_tracker
     """
-    # 1) Construire les séries
-    series = build_series(data, COUNTRY_HIGH, COUNTRY_LOW, MATU_LONG, MATU_SHORT, MATU_SPREAD, BENCHMARK_CURVE_COUNTRY).dropna()
+    assert "Alpha" in rr_results.columns and "Beta" in rr_results.columns and "R2" in rr_results.columns, \
+        "rr_results doit contenir les colonnes Alpha, Beta, R2 (utilise rolling_regression modifié)."
+
+    # Séries source
     y_all = series["BOX"]
     x_all = series[driver]
+    idx = y_all.index
 
+    # On itère sur chaque fin de fenêtre d'entraînement (t0)
     trades = []
+    for t0 in rr_results.index:
+        # position de t0 dans l'index des séries
+        pos0 = idx.get_indexer([t0])[0]
+        if pos0 == -1:
+            continue  # t0 pas trouvé (ne devrait pas arriver si les index sont alignés)
 
-    # 2) Boucle décisionnelle sur toutes les dates
-    for t in y_all.index:
-        # Fenêtre d'entraînement "pure past": [t - OBS - TRAIN, t - OBS)
-        start_train = t - pd.Timedelta(days=obs_window_days + train_window_days)
-        end_train   = t - pd.Timedelta(days=obs_window_days)
-        train_mask = (y_all.index >= start_train) & (y_all.index < end_train)
+        # Date d'entrée = après la fenêtre d'observation (obs_window_days obs plus tard)
+        entry_pos = pos0 + obs_window_days
+        if entry_pos >= len(idx):
+            continue
+        entry_date = idx[entry_pos]
 
-        # On exige une fenêtre pleine (≈ train_window_days obs valides)
-        df_tr = pd.concat([y_all.loc[train_mask].rename("y"),
-                           x_all.loc[train_mask].rename("x")], axis=1).dropna()
-        if len(df_tr) < train_window_days:
+        # Valeurs à l'entrée
+        y_t = y_all.iloc[entry_pos]
+        x_t = x_all.iloc[entry_pos]
+        if pd.isna(y_t) or pd.isna(x_t):
             continue
 
-        # OLS (BOX ~ const + driver)
-        X = sm.add_constant(df_tr["x"].values)
-        model = sm.OLS(df_tr["y"].values, X).fit()
+        # Paramètres gelés au t0 (fin de training)
+        alpha_t0 = rr_results.loc[t0, "Alpha"]
+        beta_t0  = rr_results.loc[t0, "Beta"]
+        r2_t0    = rr_results.loc[t0, "R2"]
 
-        # Valeurs observées à t
-        if t not in x_all.index or pd.isna(x_all.loc[t]) or pd.isna(y_all.loc[t]):
-            continue
-        y_t = y_all.loc[t]
-        x_t = x_all.loc[t]
-
-        # Prédiction et résiduel
-        y_hat_t = model.params[0] + model.params[1] * x_t
+        # Prédiction & résidu à la date d'entrée
+        y_hat_t = alpha_t0 + beta_t0 * x_t
         resid_t = y_t - y_hat_t
 
-        # Conditions d’entrée (seuil sur |epsilon| + filtre R²)
-        if (abs(resid_t) < resid_threshold) or (model.rsquared < r2_entry_threshold):
+        # Filtre d'entrée
+        if (abs(resid_t) < resid_threshold) or (r2_t0 < r2_entry_threshold):
             continue
 
-        # Direction de la position
+        # Direction
         side = +1 if resid_t > 0 else -1
-        entry_date = t
-        entry_box  = y_t
-        pred_t     = y_hat_t
-        beta_t     = float(model.params[1])
-        r2_t       = float(model.rsquared)
+        entry_box = float(y_t)
 
-        # Trajectoire future sur la période de holding (exclut t, inclut t+holding)
-        end_hold = t + pd.Timedelta(days=holding_days)
-        path = y_all.loc[(y_all.index > t) & (y_all.index <= end_hold)].dropna()
-
+        # Trajectoire sur les HOLDING_DAYS obs suivantes
+        exit_pos = min(entry_pos + holding_days, len(idx) - 1)
+        path = y_all.iloc[entry_pos+1: exit_pos+1]  # (entry; exit]
         if len(path) == 0:
-            # Pas de points futurs -> sortie immédiate (rare)
-            exit_date = t
+            exit_date = entry_date
             exit_box  = entry_box
             reason    = "TIME"
         else:
-            # ΔBOX = BOX_d - BOX_entry et recherche du premier hit TP/SL
             delta = path - entry_box
             tp = tp_mult * resid_threshold
             sl = sl_mult * resid_threshold
             exit_date, reason = _first_cross(delta, tp, sl, side)
-            exit_box = y_all.loc[exit_date]
+            exit_box = float(y_all.loc[exit_date])
 
-        # PnL réalisé (k€)
         pnl = -side * (exit_box - entry_box) * dv01_k
 
         trades.append({
             "Entry": entry_date,
             "Exit": exit_date,
             "Side": "LONG_BOX" if side==+1 else "SHORT_BOX",
-            "EntryBox": float(entry_box),
-            "Predicted": float(pred_t),
+            "EntryBox": entry_box,
+            "Predicted": float(y_hat_t),
             "Residual": float(resid_t),
-            "Beta": beta_t,
-            "R2": r2_t,
+            "Beta": float(beta_t0),
+            "R2": float(r2_t0),
             "Reason": reason,
-            "ExitBox": float(exit_box),
+            "ExitBox": exit_box,
             "PnL": float(pnl)
         })
 
-    # 3) Résumé des trades + construction du PnL mark-to-market
     trades_df = pd.DataFrame(trades)
     if trades_df.empty:
         return trades_df, pd.DataFrame()
 
-    # Ordonner par date d’entrée pour nommer Trade_1..N
+    # PnL tracker (mark-to-market en continu)
     trades_df = trades_df.sort_values("Entry").reset_index(drop=True)
-
-    # Index temporel du PnL tracker: de la 1ère entrée à la dernière sortie
     start_all = trades_df["Entry"].min()
     end_all   = trades_df["Exit"].max()
     all_dates = y_all.loc[(y_all.index >= start_all) & (y_all.index <= end_all)].index
-
     pnl_tracker = pd.DataFrame(index=all_dates)
 
-    # Pour chaque trade: 0 le jour d’entrée, MtM entre (entry; exit], valeur figée après
     for i, row in trades_df.iterrows():
-        entry = row["Entry"]
-        exit_ = row["Exit"]
+        entry = row["Entry"]; exit_ = row["Exit"]
         side  = +1 if row["Side"] == "LONG_BOX" else -1
         entry_box = row["EntryBox"]
 
-        ser = pd.Series(0.0, index=all_dates)  # initialise à 0 (y compris jour d’entrée)
-
-        # PnL latent (mark-to-market) pour les jours (entry; exit]
+        ser = pd.Series(0.0, index=all_dates)  # 0 le jour d’entrée
+        # MtM entre (entry; exit]
         in_window = (ser.index > entry) & (ser.index <= exit_)
         if in_window.any():
             box_slice = y_all.reindex(ser.index).loc[in_window]
-            ser.loc[in_window] = -side * (box_slice - entry_box) * DV01_K
-
-        # Après la sortie: PnL reste figé (valeur au jour de sortie)
+            ser.loc[in_window] = -side * (box_slice - entry_box) * dv01_k
+        # valeur figée après sortie
         after_exit = ser.index > exit_
         if after_exit.any():
             ser.loc[after_exit] = ser.loc[ser.index == exit_].iloc[0]
 
         pnl_tracker[f"Trade_{i+1}"] = ser
 
-    # PnL cumulé du portefeuille (somme des colonnes Trade_i)
     pnl_tracker["CumPnL"] = pnl_tracker.sum(axis=1)
 
-    # PnL cumulé **réalisé** par ordre de sortie
+    # PnL réalisé cumulé (par ordre de sortie)
     trades_df = trades_df.sort_values("Exit").reset_index(drop=True)
     trades_df["RealizedCumPnL"] = trades_df["PnL"].cumsum()
 
@@ -521,51 +355,21 @@ def backtest_strategy_days(data: pd.DataFrame,
 # PLOTS — Résultats du backtest
 # =========================
 def plot_cum_pnl_realized(trades_df: pd.DataFrame, title="Realized Cumulative PnL (k€)"):
-    """
-    BUT
-    ----
-    Tracer le PnL **réalisé cumulé** (somme des PnL des trades, par date de sortie).
-
-    PARAMÈTRES
-    ----------
-    trades_df : pd.DataFrame
-        Tableau des trades avec colonne 'RealizedCumPnL'.
-    title : str
-        Titre du graphique.
-    """
+    """Trace le PnL réalisé cumulé (somme des PnL à la date de sortie de chaque trade)."""
     if trades_df.empty:
-        print("Pas de trades générés.")
-        return
-
+        print("Pas de trades générés."); return
     plt.figure(figsize=(12,5))
     plt.plot(trades_df["Exit"], trades_df["RealizedCumPnL"])
-    plt.title(title)
-    plt.xlabel("Exit date"); plt.ylabel("Cum PnL (k€)")
+    plt.title(title); plt.xlabel("Exit date"); plt.ylabel("Cum PnL (k€)")
     plt.grid(True); plt.show()
 
-
 def plot_portfolio_pnl(pnl_tracker: pd.DataFrame, title="Portfolio PnL (mark-to-market)"):
-    """
-    BUT
-    ----
-    Tracer le PnL cumulé **mark-to-market** du portefeuille (somme quotidienne
-    des PnL de tous les trades, ouverts + fermés (valeur figée après sortie)).
-
-    PARAMÈTRES
-    ----------
-    pnl_tracker : pd.DataFrame
-        DataFrame avec colonnes 'Trade_1'..'Trade_N' + 'CumPnL'.
-    title : str
-        Titre du graphique.
-    """
+    """Trace le PnL cumulé mark-to-market (positions ouvertes + fermées figées)."""
     if pnl_tracker.empty:
-        print("Pnl tracker vide.")
-        return
-
+        print("Pnl tracker vide."); return
     plt.figure(figsize=(12,5))
     plt.plot(pnl_tracker.index, pnl_tracker["CumPnL"])
-    plt.title(title)
-    plt.xlabel("Date"); plt.ylabel("Cum PnL (k€)")
+    plt.title(title); plt.xlabel("Date"); plt.ylabel("Cum PnL (k€)")
     plt.grid(True); plt.show()
 
 
@@ -573,60 +377,35 @@ def plot_portfolio_pnl(pnl_tracker: pd.DataFrame, title="Portfolio PnL (mark-to-
 # ==== EXEMPLES D’APPELS SÉPARÉS ====
 # =========================
 
-# IMPORTANT : on suppose que tu as déjà une DataFrame `data`
-# avec des colonnes nommées "Country Matu" (ex: "Italy 10Y", "Germany 5Y", etc.)
-# et un index de dates (type datetime, trié).
+# Hypothèse: `data` existe (index Datetime trié, colonnes "Country Matu")
 
-# 1) === ANALYSE (rolling regressions sur NIVEAUX) ===
-#    - Construit BOX/SPREAD/CURVE
-#    - Estime BOX~SPREAD et BOX~CURVE (fenêtre = ROLLING_WINDOW_DAYS)
-#    - Trace R², Beta, T-stat, Residual + scatterplots Beta vs niveau
-series, rr_spread, rr_curve = run_analysis_levels(data)
+# 1) === ANALYSE NIVEAUX (fenêtre courte pour l’explo, ex: 63) ===
+# series_lvl, rr_spread_lvl_63, rr_curve_lvl_63 = run_analysis_levels(data, window=63, do_plots=True)
 
-print("\n=== APERÇU series (BOX/SPREAD/CURVE) ===")
-print(series.head())
+# 2) === ANALYSE DAILY CHANGES (fenêtre courte pour l’explo, ex: 63) ===
+# changes, rr_spread_chg_63, rr_curve_chg_63 = run_analysis_daily_changes(data, window=63, do_plots=True)
 
-print("\n=== APERÇU rolling BOX~SPREAD ===")
-print(rr_spread.head())
+# 3) === BACKTEST À PARTIR DE LA ROLLING REGRESSION (fenêtre TRAIN = 126 obs) ===
+#    -> on recalcule la rolling OLS sur NIVEAUX avec fenêtrage 126 (et sans plots),
+#       puis on réutilise Alpha/Beta/R² + on applique un OBS_WINDOW de 21 obs
+# series_bt, rr_spread_bt, rr_curve_bt = run_analysis_levels(data, window=TRAIN_WINDOW_DAYS, do_plots=False)
 
-print("\n=== APERÇU rolling BOX~CURVE ===")
-print(rr_curve.head())
-
-
-# 2) === BACKTEST (régressions sur NIVEAUX + fenêtre d’observation) ===
-#    - Entraîne sur [t - OBS - TRAIN, t - OBS)
-#    - Décide à t via |resid_t| et R²
-#    - Gère TP/SL/TIME pendant HOLDING_DAYS
-#    - Renvoie:
-#        * trades_df (PnL réalisé, raisons de sortie, cumulé réalisé)
-#        * pnl_tracker (PnL MtM journalier par trade + CumPnL portefeuille)
-trades_df, pnl_tracker = backtest_strategy_days(
-    data,
-    train_window_days=TRAIN_WINDOW_DAYS,   # 126
-    obs_window_days=OBS_WINDOW_DAYS,       # 21
-    holding_days=HOLDING_DAYS,             # 21
-    resid_threshold=RESID_THRESHOLD,       # 2.0
-    r2_entry_threshold=R2_ENTRY_THRESHOLD, # 0.30
-    tp_mult=TP_MULT,                       # 0.5
-    sl_mult=SL_MULT,                       # 0.5
-    dv01_k=DV01_K,                         # 10.0 (k€)
-    driver=DRIVER_FOR_SIGNAL               # "SPREAD" ou "CURVE"
-)
-
-print("\n=== APERÇU trades_df ===")
-print(trades_df.head())
-
-print("\n=== APERÇU pnl_tracker ===")
-print(pnl_tracker.head())
-
-
-# 3) === PLOTS des résultats du backtest ===
-plot_cum_pnl_realized(
-    trades_df,
-    title=f"Realized PnL – {COUNTRY_HIGH}-{COUNTRY_LOW} {MATU_SHORT}s{MATU_LONG} (driver: {DRIVER_FOR_SIGNAL})"
-)
-plot_portfolio_pnl(
-    pnl_tracker,
-    title=f"Portfolio MtM PnL – {COUNTRY_HIGH}-{COUNTRY_LOW} {MATU_SHORT}s{MATU_LONG} (driver: {DRIVER_FOR_SIGNAL})"
-)
+#    -> Choix du driver: "SPREAD" (ou "CURVE")
+# rr_driver = rr_spread_bt  # ou rr_curve_bt si tu veux baser la strat sur la courbe
+# trades_df, pnl_tracker = backtest_from_rr(
+#     series_bt,
+#     rr_driver,
+#     driver=DRIVER_FOR_SIGNAL,       # "SPREAD" si rr_driver = rr_spread_bt ; "CURVE" si rr_driver = rr_curve_bt
+#     obs_window_days=OBS_WINDOW_DAYS,  # 21 obs de cooldown
+#     holding_days=HOLDING_DAYS,        # 21 obs max
+#     resid_threshold=0.5,              # ex pour tester des entrées plus fréquentes
+#     r2_entry_threshold=0.0,           # ex: sans filtre R² pour tester
+#     tp_mult=TP_MULT,
+#     sl_mult=SL_MULT,
+#     dv01_k=DV01_K
+# )
+# print(trades_df.head())
+# print(pnl_tracker.head())
+# plot_cum_pnl_realized(trades_df, "Realized PnL — RR-based backtest (Levels)")
+# plot_portfolio_pnl(pnl_tracker, "Portfolio MtM PnL — RR-based backtest (Levels)")
 
