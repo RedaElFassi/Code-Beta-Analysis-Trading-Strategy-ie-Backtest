@@ -9,7 +9,7 @@ import pandas as pd
 import statsmodels.api as sm
 
 import dash
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, State
 from dash import dash_table
 import plotly.graph_objs as go
 
@@ -338,7 +338,7 @@ def backtest_from_master(
 # Heatmap & Stats
 # =========================
 def monthly_pnl_heatmap(trades_df: pd.DataFrame, pnl_tracker: pd.DataFrame) -> Tuple[go.Figure, List[int], pd.DataFrame]:
-    """Rows = 'Average' + years (DESC). Cols = months + 'YearTotal'.
+    """Rows = 'Average' + years (DESC). Cols = months.
        Cell (y,m) = PnL(k€) of portfolio built from trades ENTERED in month m of year y
        (end-of-month − start-of-month)."""
     if trades_df.empty or pnl_tracker.empty:
@@ -374,13 +374,10 @@ def monthly_pnl_heatmap(trades_df: pd.DataFrame, pnl_tracker: pd.DataFrame) -> T
             v1 = float(port.loc[end_dt])   if end_dt   in port.index else float(port.iloc[-1])
             mat.loc[str(y), MONTH_NAMES[m-1]] = v1 - v0
 
-    # Year total (utile pour stats, pas affiché dans la heatmap)
-    mat["YearTotal"] = mat.sum(axis=1, numeric_only=True)
-
-    avg = pd.DataFrame([mat.mean(axis=0, numeric_only=True)], index=["Average"])
+    avg = pd.DataFrame([mat[MONTH_NAMES].mean(axis=0)], index=["Average"])
     mat2 = pd.concat([avg, mat], axis=0)
 
-    # Heatmap (mois uniquement)
+    # Heatmap
     z = mat2[MONTH_NAMES].values.astype(float)
     text_vals = np.where(np.isfinite(z), np.round(z, 1), np.nan)
     palette = [
@@ -406,7 +403,7 @@ def monthly_pnl_heatmap(trades_df: pd.DataFrame, pnl_tracker: pd.DataFrame) -> T
     ))
     fig.update_layout(
         template="plotly_white",
-        title="Monthly PnL heatmap (portfolio of trades entered in that month)",
+        title="Monthly PnL heatmap (trades entered in that month)",
         xaxis=dict(side="top", tickangle=0),
         yaxis=dict(autorange="reversed"),
         margin=dict(l=60, r=20, t=50, b=40),
@@ -476,7 +473,7 @@ app.layout = html.Div([
     html.H2("📊 Box vs Spread/Curve — Regressions & Backtest"),
     html.Div(id="warn-data", style={"color": "crimson", "marginBottom": "8px"}),
 
-    # Top selectors
+    # Top selectors (plots scope)
     html.Div([
         html.Div([
             html.Label("Country (HIGH leg) vs Germany"),
@@ -518,16 +515,12 @@ app.layout = html.Div([
             html.Label("Rolling regression window"),
             dcc.RadioItems(id="window", options=WINDOW_OPTIONS, value=DEFAULT_WINDOW, inline=True),
         ], style={"display":"inline-block","marginRight":"24px"}),
+
         html.Div([
             html.Label("Lookback — plots (years)"),
             dcc.Slider(id="lookback-plots", min=1, max=MAX_LOOKBACK_YEARS, step=1, value=DEFAULT_LOOKBACK_PLOTS,
                        marks={i: str(i) for i in range(1, MAX_LOOKBACK_YEARS+1)}),
-        ], style={"display":"inline-block","width":"40%","verticalAlign":"top","marginRight":"24px"}),
-        html.Div([
-            html.Label("Lookback — backtest (years)"),
-            dcc.Slider(id="lookback-bt", min=1, max=MAX_LOOKBACK_YEARS, step=1, value=DEFAULT_LOOKBACK_BT,
-                       marks={i: str(i) for i in range(1, MAX_LOOKBACK_YEARS+1)}),
-        ], style={"display":"inline-block","width":"40%","verticalAlign":"top"}),
+        ], style={"display":"inline-block","width":"55%","verticalAlign":"top"}),
     ]),
 
     html.Div(id="warn-maturity", style={"color": "crimson", "margin": "8px 0"}),
@@ -585,6 +578,7 @@ app.layout = html.Div([
 
     # Section 4 — Backtest
     html.H3("4) Backtest", style={"marginBottom":"6px"}),
+
     html.Div([
         html.Div([
             html.Label("Mode"),
@@ -597,9 +591,15 @@ app.layout = html.Div([
                 value=MODE_BOX, inline=True
             )
         ], style={"display": "inline-block", "marginRight": "24px"}),
+
+        html.Div([
+            html.Label("Lookback — backtest (years)"),
+            dcc.Slider(id="lookback-bt", min=1, max=MAX_LOOKBACK_YEARS, step=1, value=DEFAULT_LOOKBACK_BT,
+                       marks={i: str(i) for i in range(1, MAX_LOOKBACK_YEARS+1)}),
+        ], style={"display":"inline-block","width":"50%","verticalAlign":"top"}),
     ], style={"marginBottom": "6px"}),
 
-    # Backtest params (ici)
+    # Backtest params (section 4)
     html.Div([
         html.Div([
             html.Label("Obs delay L (days)"),
@@ -817,9 +817,9 @@ def fig_scatter_beta_year_heat(
     Input("window", "value"),
 
     Input("lookback-plots", "value"),
-    Input("lookback-bt", "value"),
 
-    # BACKTEST params
+    # BACKTEST params (section 4)
+    Input("lookback-bt", "value"),
     Input("obs", "value"),
     Input("hold", "value"),
     Input("cooldown", "value"),
@@ -831,8 +831,8 @@ def fig_scatter_beta_year_heat(
     Input("bt-mode", "value"),
 )
 def update_all(country, m_long, m_short, spread_mode, window,
-               lookback_plots, lookback_bt,
-               obs, hold, cooldown, r2_scatter, r2_bt, eps_thr, tp_mult, sl_mult, bt_mode):
+               lookback_plots,
+               lookback_bt, obs, hold, cooldown, r2_scatter, r2_bt, eps_thr, tp_mult, sl_mult, bt_mode):
 
     empty = go.Figure(); empty.update_layout(template="plotly_white")
 
@@ -959,10 +959,10 @@ def update_all(country, m_long, m_short, spread_mode, window,
 
     bullets = html.Ul([
         html.Li(f"Signal ε = BOX − (α + β·Spread_{spread_used}). Entry si |ε| ≥ {float(eps_thr):.2f} bps & R² ≥ {float(r2_bt):.2f}."),
-        html.Li(f"Timing: window={w}d OLS, L={int(obs)}d delay, H={int(hold)}d max holding, cooldown={int(cooldown)}d (pas de nouvelle entrée)."),
+        html.Li(f"Timing: window={w}d OLS, L={int(obs)}d delay, H={int(hold)}d max holding, cooldown={int(cooldown)}d (no new entry)."),
         html.Li("Stops sur l’actif tradé: TP/SL = ±(mult × |ε|) sur BOX ou (BOX−β·SPREAD)."),
         html.Li("Modes: BOX (long/short BOX) vs PAIR (long/short [BOX−β·SPREAD]) avec β gelé à l’entrée."),
-        html.Li(f"Spread tenor utilisé: {spread_used}. Box: {m_short.lower()}s{m_long} {country} vs {BASELINE_LOW_COUNTRY}."),
+        html.Li(f"Spread tenor: {spread_used}. Box: {m_short.lower()}s{m_long} {country} vs {BASELINE_LOW_COUNTRY}."),
         html.Li(f"DV01 par trade = {DV01_K:.0f} k€; MtM du portefeuille = somme des MtM des trades vivants."),
     ])
 
@@ -980,54 +980,63 @@ def update_all(country, m_long, m_short, spread_mode, window,
     )
 
 # =========================
-# Callback heatmap + table
+# Callback heatmap (only)
 # =========================
 @app.callback(
     Output("fig_heatmap", "figure"),
     Output("heatmap-note", "children"),
     Output("year-select", "options"),
     Output("year-select", "value"),
-    Output("trades-table", "data"),
-
     Input("store-trades", "data"),
     Input("store-pnl", "data"),
-    Input("country", "value"),
-    Input("matu-long", "value"),
-    Input("matu-short", "value"),
-    Input("spread-tenor-mode", "value"),
-    Input("bt-mode", "value"),
-    Input("year-select", "value")
 )
-def update_heatmap_and_table(store_trades, store_pnl, country, m_long, m_short, spread_mode, bt_mode, year_selected):
+def update_heatmap(store_trades, store_pnl):
     if not store_trades or not store_pnl:
-        return go.Figure(layout=go.Layout(template="plotly_white")), "", [], None, []
+        return go.Figure(layout=go.Layout(template="plotly_white")), "", [], None
 
     trades_df = pd.read_json(store_trades, orient="split")
     pnl_tracker = pd.read_json(store_pnl, orient="split")
 
-    master = get_master_cached(country, m_long, m_short, DEFAULT_WINDOW, spread_mode)
-    if master is None:
-        master = pd.DataFrame(index=pnl_tracker.index)
-
     heatmap_fig, years_asc, _ = monthly_pnl_heatmap(trades_df, pnl_tracker)
     note = ("Rows: Average + years; Columns: months. "
-            "Cell = PnL(k€) of portfolio made ONLY of trades entered in that month (EOM − SOM).")
+            "Cell = PnL(k€) of portfolio made ONLY of trades entered that month (EOM − SOM).")
 
     options = [{"label": str(y), "value": int(y)} for y in years_asc]
-    if (year_selected is None) or (year_selected not in years_asc):
-        year_selected = years_asc[-1] if years_asc else None
+    year_value = (years_asc[-1] if years_asc else None)
+    return heatmap_fig, note, options, year_value
 
-    if year_selected is None:
-        table_data = []
-    else:
-        sub = trades_df[trades_df["Entry"].dt.year == int(year_selected)].copy()
-        sub_stats = compute_trade_stats_table(sub, master, bt_mode)
-        if not sub_stats.empty:
-            sub_stats["Entry"] = pd.to_datetime(sub_stats["Entry"]).dt.strftime("%Y-%m-%d")
-            sub_stats["Exit"]  = pd.to_datetime(sub_stats["Exit"]).dt.strftime("%Y-%m-%d")
-        table_data = sub_stats.to_dict("records")
+# =========================
+# Callback trades table (separate to avoid circular dep)
+# =========================
+@app.callback(
+    Output("trades-table", "data"),
+    Input("store-trades", "data"),
+    Input("year-select", "value"),
+    State("country", "value"),
+    State("matu-long", "value"),
+    State("matu-short", "value"),
+    State("spread-tenor-mode", "value"),
+    State("bt-mode", "value"),
+)
+def update_trades_table(store_trades, year_selected, country, m_long, m_short, spread_mode, bt_mode):
+    if not store_trades or (year_selected is None):
+        return []
 
-    return heatmap_fig, note, options, year_selected, table_data
+    trades_df = pd.read_json(store_trades, orient="split")
+    sub = trades_df[trades_df["Entry"].dt.year == int(year_selected)].copy()
+    if sub.empty:
+        return []
+
+    master = get_master_cached(country, m_long, m_short, DEFAULT_WINDOW, spread_mode)
+    if master is None:
+        return []
+
+    sub_stats = compute_trade_stats_table(sub, master, bt_mode)
+    if sub_stats.empty:
+        return []
+    sub_stats["Entry"] = pd.to_datetime(sub_stats["Entry"]).dt.strftime("%Y-%m-%d")
+    sub_stats["Exit"]  = pd.to_datetime(sub_stats["Exit"]).dt.strftime("%Y-%m-%d")
+    return sub_stats.to_dict("records")
 
 # =========================
 # Main
