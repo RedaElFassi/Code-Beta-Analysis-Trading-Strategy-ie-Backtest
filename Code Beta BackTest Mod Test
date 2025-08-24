@@ -22,7 +22,7 @@ except Exception:
     try:
         from data_loader import data  # type: ignore
     except Exception:
-        data = None  # warning in UI
+        data = None  # will fallback to mock
 
 # =========================
 # Config
@@ -60,7 +60,7 @@ MODE_PAIR = "PAIR"   # Box − β·Spread
 MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
 # =========================
-# Helpers
+# Helpers (NO NameError)
 # =========================
 def _col(country, matu): return f"{country} {matu}"
 def _safe_name(x): return x.replace(" ", "_")
@@ -84,6 +84,47 @@ def box_label(country_high: str, country_low: str, short_m: str, long_m: str) ->
 
 def spread_tenor_label(mode: str, long_m: str) -> str:
     return "10Y" if mode == TENOR_10Y else long_m
+
+def empty_fig(title: Optional[str] = None) -> go.Figure:
+    fig = go.Figure()
+    if title:
+        fig.update_layout(title=title)
+    fig.update_layout(template="plotly_white",
+                      margin=dict(l=50, r=20, t=30, b=40))
+    return fig
+
+def generate_mock_data() -> pd.DataFrame:
+    """Create realistic mock yield data so the app never boots empty."""
+    rng = pd.bdate_range("2015-01-01", pd.Timestamp.today(), freq="B")
+    np.random.seed(42)
+    countries = list(set(AVAILABLE_COUNTRIES + [BENCHMARK_CURVE_COUNTRY, BASELINE_LOW_COUNTRY]))
+    mats = AVAILABLE_MATURITIES
+    base_levels = {
+        "Germany": 0.5,
+        "France":  0.8,
+        "Italy":   2.0,
+        "Spain":   1.5,
+        "Portugal":1.7,
+    }
+    df = pd.DataFrame(index=rng)
+    for c in countries:
+        lvl0 = base_levels.get(c, 1.0)
+        for m in mats:
+            yrs = int(m.replace("Y",""))
+            vol = 0.02 + 0.003*yrs
+            drift = 0.0 + 0.00002*(yrs-10)
+            steps = np.random.normal(loc=drift/252.0, scale=vol/np.sqrt(252.0), size=len(rng))
+            series = (lvl0 + np.cumsum(steps)).clip(-1.0, 7.0)
+            col = _col(c, m)
+            df[col] = series
+    return df
+
+def _get_data() -> Tuple(pd.DataFrame, bool):
+    """Return (dataframe, used_mock)"""
+    global data
+    if data is None or not isinstance(data, pd.DataFrame) or len(data.columns) == 0:
+        return generate_mock_data(), True
+    return ensure_dt_index(data.copy()), False
 
 # =========================
 # Master builder
@@ -126,6 +167,7 @@ def build_master_dataframe(
         master[_col_bps(country_high, matu_long)] - master[_col_bps(country_low,  matu_long)]
         - (master[_col_bps(country_high, matu_short)] - master[_col_bps(country_low,  matu_short)])
     )
+
     # SPREAD (tenor selectable)
     spread_matu = "10Y" if spread_tenor_mode == TENOR_10Y else matu_long
     master["SPREAD_bps"] = (df[_col(country_high, spread_matu)].astype(float)
@@ -145,7 +187,8 @@ def build_master_dataframe(
         for suff in ["alpha","beta","r2","tstat","resid"]:
             master[f"{prefix}_{suff}_w{w}"] = np.nan
         join = pd.concat([master[ycol].rename("y"), master[xcol].rename("x")], axis=1).dropna()
-        if len(join) < w: return
+        if len(join) < w:
+            return
         yv, xv, idx = join["y"].values, join["x"].values, join.index
         out = []
         for end in range(w, len(join)+1):
@@ -338,22 +381,21 @@ def backtest_from_master(
 # Heatmap & Stats
 # =========================
 def monthly_pnl_heatmap(trades_df: pd.DataFrame, pnl_tracker: pd.DataFrame) -> Tuple[go.Figure, List[int], pd.DataFrame]:
-    """Rows = 'Average' + years (DESC). Cols = months.
-       Cell (y,m) = PnL(k€) of portfolio built from trades ENTERED in month m of year y
-       (end-of-month − start-of-month)."""
+    """Rows = 'Average' + years (DESC). Cols = months; cell = PnL(k€) for portfolio of trades ENTERED that month."""
     if trades_df.empty or pnl_tracker.empty:
-        return go.Figure(layout=go.Layout(template="plotly_white")), [], pd.DataFrame()
-
-    col_map = {i+1: f"Trade_{i+1:03d}" for i in range(len(trades_df))}
-    years = sorted(trades_df["Entry"].dt.year.unique().tolist(), reverse=True)
-    months = list(range(1,13))
-    mat = pd.DataFrame(index=[str(y) for y in years], columns=MONTH_NAMES, dtype=float)
+        # return a minimal non-empty heatmap (zeros) so UI is not blank
+        return empty_fig(), [], pd.DataFrame()
 
     trades_df = trades_df.copy()
+    trades_df["Entry"] = pd.to_datetime(trades_df["Entry"])
+    years = sorted(trades_df["Entry"].dt.year.unique().tolist(), reverse=True)
+    col_map = {i+1: f"Trade_{i+1:03d}" for i in range(len(trades_df))}
+    mat = pd.DataFrame(index=[str(y) for y in years], columns=MONTH_NAMES, dtype=float)
+
     trades_df["TradeIdx"] = trades_df.index + 1
 
     for y in years:
-        for m in months:
+        for m in range(1, 13):
             cond = (trades_df["Entry"].dt.year == y) & (trades_df["Entry"].dt.month == m)
             idxs = trades_df.loc[cond, "TradeIdx"].astype(int).tolist()
             if len(idxs) == 0:
@@ -374,10 +416,9 @@ def monthly_pnl_heatmap(trades_df: pd.DataFrame, pnl_tracker: pd.DataFrame) -> T
             v1 = float(port.loc[end_dt])   if end_dt   in port.index else float(port.iloc[-1])
             mat.loc[str(y), MONTH_NAMES[m-1]] = v1 - v0
 
-    avg = pd.DataFrame([mat[MONTH_NAMES].mean(axis=0)], index=["Average"])
+    avg = pd.DataFrame([mat.mean(axis=0, numeric_only=True)], index=["Average"])
     mat2 = pd.concat([avg, mat], axis=0)
 
-    # Heatmap
     z = mat2[MONTH_NAMES].values.astype(float)
     text_vals = np.where(np.isfinite(z), np.round(z, 1), np.nan)
     palette = [
@@ -390,25 +431,17 @@ def monthly_pnl_heatmap(trades_df: pd.DataFrame, pnl_tracker: pd.DataFrame) -> T
         [1.0,  "#00441b"]
     ]
     fig = go.Figure(data=go.Heatmap(
-        z=z,
-        x=MONTH_NAMES,
-        y=list(mat2.index),
-        colorscale=palette,
-        zmid=0,
-        colorbar=dict(title="PnL (k€)"),
-        text=text_vals,
-        texttemplate="%{text}",
-        textfont={"color":"black","size":12},
+        z=z, x=MONTH_NAMES, y=list(mat2.index),
+        colorscale=palette, zmid=0, colorbar=dict(title="PnL (k€)"),
+        text=text_vals, texttemplate="%{text}", textfont={"color":"black","size":12},
         hovertemplate="<b>%{y}</b> — %{x}<br>PnL: %{z:.1f} k€<extra></extra>",
     ))
     fig.update_layout(
         template="plotly_white",
-        title="Monthly PnL heatmap (trades entered in that month)",
         xaxis=dict(side="top", tickangle=0),
         yaxis=dict(autorange="reversed"),
-        margin=dict(l=60, r=20, t=50, b=40),
+        margin=dict(l=60, r=20, t=40, b=40),
     )
-    # years asc pour le dropdown
     return fig, sorted([int(y) for y in years]), mat2
 
 def compute_trade_stats_table(trades_df: pd.DataFrame, master: pd.DataFrame, mode: str) -> pd.DataFrame:
@@ -419,7 +452,7 @@ def compute_trade_stats_table(trades_df: pd.DataFrame, master: pd.DataFrame, mod
     x_col = "SPREAD_bps"; y_col = "BOX_bps"
     rows = []
     for _, r in trades_df.iterrows():
-        entry, exit_ = r["Entry"], r["Exit"]
+        entry, exit_ = pd.to_datetime(r["Entry"]), pd.to_datetime(r["Exit"])
         side = +1 if r["Side"] == "LONG" else -1
         entry_level = float(r["EntryLevel"])
         b0 = float(r["Beta"])
@@ -450,15 +483,83 @@ def get_master_cached(country: str, long_m: str, short_m: str, window: int, spre
     key = (country, long_m, short_m, int(window), spread_tenor_mode)
     if key in _MASTER_CACHE:
         return _MASTER_CACHE[key]
-    if data is None:
-        return None
+    df_data, _ = _get_data()
     m = build_master_dataframe(
-        data, country_high=country, country_low=BASELINE_LOW_COUNTRY,
+        df_data, country_high=country, country_low=BASELINE_LOW_COUNTRY,
         matu_long=long_m, matu_short=short_m, window=int(window),
         curve_country=BENCHMARK_CURVE_COUNTRY, spread_tenor_mode=spread_tenor_mode
     )
     _MASTER_CACHE[key] = m
     return m
+
+# =========================
+# Small figure helpers (defined BEFORE callbacks)
+# =========================
+def fig_ts(y: pd.Series, title: Optional[str], ylab: str) -> go.Figure:
+    y = y.dropna() if isinstance(y, pd.Series) else pd.Series(dtype=float)
+    fig = go.Figure()
+    if not y.empty:
+        fig.add_trace(go.Scatter(x=y.index, y=y.values, mode="lines", name=ylab))
+    if title:
+        fig.update_layout(title=title)
+    fig.update_layout(template="plotly_white",
+                      xaxis=dict(tickformat="%Y"),
+                      yaxis=dict(title=ylab),
+                      margin=dict(l=50, r=20, t=30, b=40),
+                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right"))
+    return fig
+
+def fig_scatter_heatmap_with_poly(
+    x: pd.Series, y: pd.Series, index: pd.DatetimeIndex,
+    title: Optional[str], xlab: str, ylab: str, poly_deg: int = 2
+) -> go.Figure:
+    dfp = pd.DataFrame({"x": x, "y": y}, index=pd.to_datetime(index)).dropna()
+    fig = go.Figure()
+    if title:
+        fig.update_layout(title=title)
+    fig.update_layout(xaxis_title=xlab, yaxis_title=ylab, template="plotly_white",
+                      margin=dict(l=50, r=70, t=30, b=40),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    if dfp.empty:
+        return fig
+    years = dfp.index.year
+    cmin, cmax = int(years.min()), int(years.max())
+    fig.add_trace(go.Scatter(
+        x=dfp["x"], y=dfp["y"], mode="markers",
+        marker=dict(size=6, color=years, colorscale="RdBu_r",
+                    cmin=cmin, cmax=cmax, showscale=True,
+                    colorbar=dict(title="Year", x=1.02)),
+        hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<extra></extra>",
+        showlegend=False
+    ))
+    if len(dfp) >= (poly_deg + 1):
+        try:
+            xs = dfp["x"].values; ys = dfp["y"].values
+            order = np.argsort(xs)
+            xs_sorted, ys_sorted = xs[order], ys[order]
+            coeffs = np.polyfit(xs_sorted, ys_sorted, deg=poly_deg)
+            x_line = np.linspace(xs_sorted.min(), xs_sorted.max(), 300)
+            y_line = np.polyval(coeffs, x_line)
+            fig.add_trace(go.Scatter(x=x_line, y=y_line, mode="lines", name=f"Poly fit (deg={poly_deg})",
+                                     hoverinfo="skip"))
+        except Exception:
+            pass
+    return fig
+
+def fig_scatter_beta_year_heat(
+    master: pd.DataFrame, beta_col: str, x_level_col: str,
+    r2_col: Optional[str] = None, r2_min: Optional[float] = None,
+    title: Optional[str] = None, xlab: str = "Level (bps)", ylab: str = "Beta",
+) -> go.Figure:
+    if master is None or master.empty:
+        return empty_fig()
+    cols = [beta_col, x_level_col] + ([r2_col] if r2_col else [])
+    df = master[cols].dropna()
+    if r2_col and (r2_min is not None):
+        df = df[df[r2_col] >= float(r2_min)]
+    if df.empty:
+        return empty_fig()
+    return fig_scatter_heatmap_with_poly(df[x_level_col], df[beta_col], df.index, title, xlab, ylab, poly_deg=2)
 
 # =========================
 # App
@@ -473,7 +574,7 @@ app.layout = html.Div([
     html.H2("📊 Box vs Spread/Curve — Regressions & Backtest"),
     html.Div(id="warn-data", style={"color": "crimson", "marginBottom": "8px"}),
 
-    # Top selectors (plots scope)
+    # Top selectors
     html.Div([
         html.Div([
             html.Label("Country (HIGH leg) vs Germany"),
@@ -520,8 +621,8 @@ app.layout = html.Div([
             html.Label("Lookback — plots (years)"),
             dcc.Slider(id="lookback-plots", min=1, max=MAX_LOOKBACK_YEARS, step=1, value=DEFAULT_LOOKBACK_PLOTS,
                        marks={i: str(i) for i in range(1, MAX_LOOKBACK_YEARS+1)}),
-        ], style={"display":"inline-block","width":"55%","verticalAlign":"top"}),
-    ]),
+        ], style={"display":"inline-block","width":"60%","verticalAlign":"top"}),
+    ], style={"marginBottom":"6px"}),
 
     html.Div(id="warn-maturity", style={"color": "crimson", "margin": "8px 0"}),
 
@@ -591,15 +692,23 @@ app.layout = html.Div([
                 value=MODE_BOX, inline=True
             )
         ], style={"display": "inline-block", "marginRight": "24px"}),
+    ], style={"marginBottom": "6px"}),
 
+    # Backtest lookback + params (TOUT est ici)
+    html.Div([
         html.Div([
             html.Label("Lookback — backtest (years)"),
             dcc.Slider(id="lookback-bt", min=1, max=MAX_LOOKBACK_YEARS, step=1, value=DEFAULT_LOOKBACK_BT,
                        marks={i: str(i) for i in range(1, MAX_LOOKBACK_YEARS+1)}),
-        ], style={"display":"inline-block","width":"50%","verticalAlign":"top"}),
-    ], style={"marginBottom": "6px"}),
+        ], style={"display":"inline-block","width":"48%","verticalAlign":"top","marginRight":"2%"}),
 
-    # Backtest params (section 4)
+        html.Div([
+            html.Label("Cooldown (no new entry, days)"),
+            dcc.Slider(id="cooldown", min=0, max=30, step=1, value=DEFAULT_COOLDOWN,
+                       marks={i: str(i) for i in range(0, 31, 5)}),
+        ], style={"display":"inline-block","width":"48%","verticalAlign":"top"}),
+    ], style={"margin":"6px 0"}),
+
     html.Div([
         html.Div([
             html.Label("Obs delay L (days)"),
@@ -622,22 +731,16 @@ app.layout = html.Div([
         ], style={"display":"inline-block","marginRight":"24px"}),
 
         html.Div([
-            html.Label("Cooldown (no new entry)"),
-            dcc.Slider(id="cooldown", min=0, max=30, step=1, value=DEFAULT_COOLDOWN,
-                       marks={i: str(i) for i in range(0, 31, 5)}),
-        ], style={"display":"inline-block","width":"22%","verticalAlign":"top","marginRight":"16px"}),
-
-        html.Div([
             html.Label("R² threshold (scatter)"),
             dcc.Slider(id="r2-scatter", min=0.0, max=1.0, step=0.05, value=DEFAULT_R2_SCATTER,
                        marks={i/10: f"{i/10:.1f}" for i in range(0, 11)}),
-        ], style={"display":"inline-block","width":"22%","verticalAlign":"top","marginRight":"16px"}),
+        ], style={"display":"inline-block","width":"28%","verticalAlign":"top","marginRight":"16px"}),
 
         html.Div([
             html.Label("R² threshold (backtest)"),
             dcc.Slider(id="r2-bt", min=0.0, max=1.0, step=0.05, value=DEFAULT_R2_BACKTEST,
                        marks={i/10: f"{i/10:.1f}" for i in range(0, 11)}),
-        ], style={"display":"inline-block","width":"22%","verticalAlign":"top"}),
+        ], style={"display":"inline-block","width":"28%","verticalAlign":"top"}),
     ], style={"margin":"6px 0"}),
 
     html.Div([
@@ -707,73 +810,6 @@ app.layout = html.Div([
 ])
 
 # =========================
-# Small figure helpers
-# =========================
-def fig_ts(y: pd.Series, title: Optional[str], ylab: str) -> go.Figure:
-    y = y.dropna()
-    fig = go.Figure()
-    if not y.empty:
-        fig.add_trace(go.Scatter(x=y.index, y=y.values, mode="lines", name=ylab))
-    if title:
-        fig.update_layout(title=title)
-    fig.update_layout(template="plotly_white",
-                      xaxis=dict(tickformat="%Y"),
-                      yaxis=dict(title=ylab),
-                      margin=dict(l=50, r=20, t=40, b=40),
-                      legend=dict(orientation="h", y=1.02, x=1, xanchor="right"))
-    return fig
-
-def fig_scatter_heatmap_with_poly(
-    x: pd.Series, y: pd.Series, index: pd.DatetimeIndex,
-    title: Optional[str], xlab: str, ylab: str, poly_deg: int = 2
-) -> go.Figure:
-    dfp = pd.DataFrame({"x": x, "y": y}, index=pd.to_datetime(index)).dropna()
-    fig = go.Figure()
-    if title:
-        fig.update_layout(title=title)
-    fig.update_layout(xaxis_title=xlab, yaxis_title=ylab, template="plotly_white",
-                      margin=dict(l=50, r=70, t=40, b=40),
-                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    if dfp.empty:
-        return fig
-    years = dfp.index.year
-    cmin, cmax = int(years.min()), int(years.max())
-    fig.add_trace(go.Scatter(
-        x=dfp["x"], y=dfp["y"], mode="markers",
-        marker=dict(size=6, color=years, colorscale="RdBu_r", cmin=cmin, cmax=cmax, showscale=True,
-                    colorbar=dict(title="Year", x=1.02)),
-        hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<extra></extra>",
-        showlegend=False
-    ))
-    if len(dfp) >= (poly_deg + 1):
-        try:
-            xs = dfp["x"].values; ys = dfp["y"].values
-            order = np.argsort(xs)
-            xs_sorted, ys_sorted = xs[order], ys[order]
-            coeffs = np.polyfit(xs_sorted, ys_sorted, deg=poly_deg)
-            x_line = np.linspace(xs_sorted.min(), xs_sorted.max(), 300)
-            y_line = np.polyval(coeffs, x_line)
-            fig.add_trace(go.Scatter(x=x_line, y=y_line, mode="lines", name=f"Poly fit (deg={poly_deg})",
-                                     hoverinfo="skip"))
-        except Exception:
-            pass
-    return fig
-
-def fig_scatter_beta_year_heat(
-    master: pd.DataFrame, beta_col: str, x_level_col: str,
-    r2_col: Optional[str] = None, r2_min: Optional[float] = None,
-    title: Optional[str] = None, xlab: str = "Level (bps)", ylab: str = "Beta",
-) -> go.Figure:
-    cols = [beta_col, x_level_col]
-    if r2_col: cols.append(r2_col)
-    df = master[cols].dropna()
-    if r2_col and (r2_min is not None):
-        df = df[df[r2_col] >= float(r2_min)]
-    if df.empty:
-        return go.Figure(layout=go.Layout(template="plotly_white", margin=dict(l=50,r=20,t=30,b=40)))
-    return fig_scatter_heatmap_with_poly(df[x_level_col], df[beta_col], df.index, title, xlab, ylab, poly_deg=2)
-
-# =========================
 # Callback principal
 # =========================
 @app.callback(
@@ -817,9 +853,9 @@ def fig_scatter_beta_year_heat(
     Input("window", "value"),
 
     Input("lookback-plots", "value"),
+    Input("lookback-bt", "value"),
 
     # BACKTEST params (section 4)
-    Input("lookback-bt", "value"),
     Input("obs", "value"),
     Input("hold", "value"),
     Input("cooldown", "value"),
@@ -831,36 +867,30 @@ def fig_scatter_beta_year_heat(
     Input("bt-mode", "value"),
 )
 def update_all(country, m_long, m_short, spread_mode, window,
-               lookback_plots,
-               lookback_bt, obs, hold, cooldown, r2_scatter, r2_bt, eps_thr, tp_mult, sl_mult, bt_mode):
+               lookback_plots, lookback_bt,
+               obs, hold, cooldown, r2_scatter, r2_bt, eps_thr, tp_mult, sl_mult, bt_mode):
 
-    empty = go.Figure(); empty.update_layout(template="plotly_white")
-
-    if data is None:
-        return ("No `data` DataFrame found. Provide it via `data_loader.py` or globally.",
-                "", "", "", "", "",
-                empty, empty, empty, empty, empty,
-                empty, empty, empty, empty, empty,
-                empty, empty, empty, empty, empty,
-                empty, empty, html.Ul([]), None, None, "")
+    df_data, used_mock = _get_data()
+    warn_data = "⚠ Using MOCK data (no `data` provided)." if used_mock else ""
 
     warn_m = ""
     if country not in AVAILABLE_COUNTRIES:
         country = AVAILABLE_COUNTRIES[0]
     if (m_long not in AVAILABLE_MATURITIES) or (m_short not in AVAILABLE_MATURITIES):
         warn_m = "Select valid maturities."
-        return ("", warn_m, "", "", "", "",
+        empty = empty_fig()
+        return (warn_data, warn_m, "", "", "", "",
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
                 empty, empty, html.Ul([]), None, None, "")
 
     try:
-        Lnum = int(m_long.replace("Y",""))
-        Snum = int(m_short.replace("Y",""))
+        Lnum = int(m_long.replace("Y","")); Snum = int(m_short.replace("Y",""))
     except Exception:
         warn_m = "Maturity parsing error."
-        return ("", warn_m, "", "", "", "",
+        empty = empty_fig()
+        return (warn_data, warn_m, "", "", "", "",
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
@@ -869,9 +899,20 @@ def update_all(country, m_long, m_short, spread_mode, window,
     if Lnum <= Snum:
         warn_m = "⚠️ Long maturity must be strictly greater than Short maturity."
 
-    master_full = get_master_cached(country, m_long, m_short, int(window), spread_mode)
+    # Build master (cached)
+    try:
+        master_full = get_master_cached(country, m_long, m_short, int(window), spread_mode)
+    except Exception as e:
+        empty = empty_fig()
+        return (f"{warn_data} Error: {e}", warn_m or "Data issue.", "", "", "", "",
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, empty, empty, empty,
+                empty, empty, html.Ul([]), None, None, "")
+
     if master_full is None or master_full.empty:
-        return ("", warn_m or "No data for this selection.", "", "", "", "",
+        empty = empty_fig()
+        return (warn_data, warn_m or "No data for this selection.", "", "", "", "",
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
@@ -888,27 +929,28 @@ def update_all(country, m_long, m_short, spread_mode, window,
     boxname = box_label(country, BASELINE_LOW_COUNTRY, m_short, m_long)
     spread_used = spread_tenor_label(spread_mode, m_long)
 
-    title_lvs = f"1) BOX vs SPREAD — tenor {spread_used} — {boxname}"
+    # Titles (courts)
+    title_lvs = f"1) BOX vs SPREAD — {spread_used} — {boxname}"
     title_lvc = f"2) BOX vs CURVE (DE {m_short}s{m_long}) — {boxname}"
-    title_dvs = f"3) ΔBOX vs ΔSPREAD — tenor {spread_used} — {boxname}"
-    curve_note = f"Curve used = {BENCHMARK_CURVE_COUNTRY} {m_short}s{m_long} (i.e., {m_long} − {m_short})"
+    title_dvs = f"3) ΔBOX vs ΔSPREAD — {spread_used} — {boxname}"
+    curve_note = f"Curve: {BENCHMARK_CURVE_COUNTRY} {m_short}s{m_long} = {m_long} − {m_short}"
 
-    fig_lvs_r2   = fig_ts(master_plots[lvs_r2],   None, "R²")
-    fig_lvs_beta = fig_ts(master_plots[lvs_beta], None, "Beta")
-    fig_lvs_res  = fig_ts(master_plots[lvs_res],  None, "Residual (bps)")
+    fig_lvs_r2   = fig_ts(master_plots.get(lvs_r2, pd.Series(dtype=float)),   None, "R²")
+    fig_lvs_beta = fig_ts(master_plots.get(lvs_beta, pd.Series(dtype=float)), None, "Beta")
+    fig_lvs_res  = fig_ts(master_plots.get(lvs_res, pd.Series(dtype=float)),  None, "Residual (bps)")
     fig_lvs_sc_all = fig_scatter_beta_year_heat(
         master_plots, beta_col=lvs_beta, x_level_col="SPREAD_bps",
-        title=f"β vs SPREAD — ALL — tenor {spread_used}", xlab="Spread (bps)", ylab="Beta"
+        title=f"β vs SPREAD — ALL — {spread_used}", xlab="Spread (bps)", ylab="Beta"
     )
     fig_lvs_sc_r2  = fig_scatter_beta_year_heat(
         master_plots, beta_col=lvs_beta, x_level_col="SPREAD_bps", r2_col=lvs_r2, r2_min=float(r2_scatter),
-        title=f"β vs SPREAD — R² ≥ {float(r2_scatter):.2f} — tenor {spread_used}",
+        title=f"β vs SPREAD — R² ≥ {float(r2_scatter):.2f} — {spread_used}",
         xlab="Spread (bps)", ylab="Beta"
     )
 
-    fig_lvc_r2   = fig_ts(master_plots[lvc_r2],   None, "R²")
-    fig_lvc_beta = fig_ts(master_plots[lvc_beta], None, "Beta")
-    fig_lvc_res  = fig_ts(master_plots[lvc_res],  None, "Residual (bps)")
+    fig_lvc_r2   = fig_ts(master_plots.get(lvc_r2, pd.Series(dtype=float)),   None, "R²")
+    fig_lvc_beta = fig_ts(master_plots.get(lvc_beta, pd.Series(dtype=float)), None, "Beta")
+    fig_lvc_res  = fig_ts(master_plots.get(lvc_res, pd.Series(dtype=float)),  None, "Residual (bps)")
     fig_lvc_sc_all = fig_scatter_beta_year_heat(
         master_plots, beta_col=lvc_beta, x_level_col="CURVE_bps",
         title="β vs CURVE — ALL", xlab="Curve (bps)", ylab="Beta"
@@ -918,17 +960,17 @@ def update_all(country, m_long, m_short, spread_mode, window,
         title=f"β vs CURVE — R² ≥ {float(r2_scatter):.2f}", xlab="Curve (bps)", ylab="Beta"
     )
 
-    fig_dvs_r2   = fig_ts(master_plots[dvs_r2],   None, "R²")
-    fig_dvs_beta = fig_ts(master_plots[dvs_beta], None, "Beta")
-    fig_dvs_res  = fig_ts(master_plots[dvs_res],  None, "Residual (bps)")
+    fig_dvs_r2   = fig_ts(master_plots.get(dvs_r2, pd.Series(dtype=float)),   None, "R²")
+    fig_dvs_beta = fig_ts(master_plots.get(dvs_beta, pd.Series(dtype=float)), None, "Beta")
+    fig_dvs_res  = fig_ts(master_plots.get(dvs_res, pd.Series(dtype=float)),  None, "Residual (bps)")
     fig_dvs_sc_all = fig_scatter_beta_year_heat(
         master_plots, beta_col=dvs_beta, x_level_col="SPREAD_bps",
-        title=f"β(Δ) vs SPREAD — ALL — tenor {spread_used}",
+        title=f"β(Δ) vs SPREAD — ALL — {spread_used}",
         xlab="Spread (bps)", ylab="Beta (Δ)"
     )
     fig_dvs_sc_r2  = fig_scatter_beta_year_heat(
         master_plots, beta_col=dvs_beta, x_level_col="SPREAD_bps", r2_col=dvs_r2, r2_min=float(r2_scatter),
-        title=f"β(Δ) vs SPREAD — R² ≥ {float(r2_scatter):.2f} — tenor {spread_used}",
+        title=f"β(Δ) vs SPREAD — R² ≥ {float(r2_scatter):.2f} — {spread_used}",
         xlab="Spread (bps)", ylab="Beta (Δ)"
     )
 
@@ -941,29 +983,29 @@ def update_all(country, m_long, m_short, spread_mode, window,
     )
 
     if trades_df.empty:
-        fig_pnl_real = go.Figure(); fig_pnl_real.update_layout(title="Realized Cum PnL (by Exit) — No trades", template="plotly_white")
-        fig_pnl_mtm  = go.Figure(); fig_pnl_mtm.update_layout(title="Portfolio MtM PnL — No trades", template="plotly_white")
+        fig_pnl_real = empty_fig("Realized Cum PnL (by Exit) — No trades")
+        fig_pnl_mtm  = empty_fig("Portfolio MtM PnL — No trades")
     else:
         y = trades_df.dropna(subset=["RealizedCumPnL_by_exit"])
         fig_pnl_real = go.Figure()
         fig_pnl_real.add_trace(go.Scatter(x=y["Exit"], y=y["RealizedCumPnL_by_exit"], mode="lines", name="CumPnL (k€)"))
         fig_pnl_real.update_layout(title="Realized Cumulative PnL (by Exit)", template="plotly_white",
                                    xaxis=dict(tickformat="%Y"), yaxis=dict(title="k€"),
-                                   margin=dict(l=50, r=20, t=40, b=40))
+                                   margin=dict(l=50, r=20, t=30, b=40))
         fig_pnl_mtm = go.Figure()
         if not pnl_tracker.empty and "CumPnL" in pnl_tracker.columns:
             fig_pnl_mtm.add_trace(go.Scatter(x=pnl_tracker.index, y=pnl_tracker["CumPnL"], mode="lines", name="CumPnL (k€)"))
         fig_pnl_mtm.update_layout(title="Portfolio MtM PnL", template="plotly_white",
                                   xaxis=dict(tickformat="%Y"), yaxis=dict(title="k€"),
-                                  margin=dict(l=50, r=20, t=40, b=40))
+                                  margin=dict(l=50, r=20, t=30, b=40))
 
     bullets = html.Ul([
-        html.Li(f"Signal ε = BOX − (α + β·Spread_{spread_used}). Entry si |ε| ≥ {float(eps_thr):.2f} bps & R² ≥ {float(r2_bt):.2f}."),
-        html.Li(f"Timing: window={w}d OLS, L={int(obs)}d delay, H={int(hold)}d max holding, cooldown={int(cooldown)}d (no new entry)."),
-        html.Li("Stops sur l’actif tradé: TP/SL = ±(mult × |ε|) sur BOX ou (BOX−β·SPREAD)."),
-        html.Li("Modes: BOX (long/short BOX) vs PAIR (long/short [BOX−β·SPREAD]) avec β gelé à l’entrée."),
+        html.Li(f"ε = BOX − (α + β·Spread_{spread_used}); entry si |ε| ≥ {float(eps_thr):.2f} bps & R² ≥ {float(r2_bt):.2f}."),
+        html.Li(f"Window OLS={w}d; L={int(obs)}d; H={int(hold)}d; cooldown={int(cooldown)}d."),
+        html.Li("TP/SL = ±(mult × |ε|) sur l’underlier (BOX ou BOX−β·SPREAD)."),
+        html.Li("Modes: BOX vs PAIR (β gelé à l’entrée)."),
         html.Li(f"Spread tenor: {spread_used}. Box: {m_short.lower()}s{m_long} {country} vs {BASELINE_LOW_COUNTRY}."),
-        html.Li(f"DV01 par trade = {DV01_K:.0f} k€; MtM du portefeuille = somme des MtM des trades vivants."),
+        html.Li(f"DV01/trade = {DV01_K:.0f} k€; PnL du portefeuille = somme des MtM des trades vivants."),
     ])
 
     store_trades = trades_df.to_json(date_format="iso", orient="split") if not trades_df.empty else None
@@ -971,7 +1013,7 @@ def update_all(country, m_long, m_short, spread_mode, window,
     warn_end = f"Backtest lookback = {int(lookback_bt)}y | Plots lookback = {int(lookback_plots)}y."
 
     return (
-        "", warn_m, title_lvs, title_lvc, title_dvs, curve_note,
+        warn_data, warn_m, title_lvs, title_lvc, title_dvs, curve_note,
         fig_lvs_r2, fig_lvs_beta, fig_lvs_res, fig_lvs_scatter_all, fig_lvs_scatter_r2,
         fig_lvc_r2, fig_lvc_beta, fig_lvc_res, fig_lvc_scatter_all, fig_lvc_scatter_r2,
         fig_dvs_r2, fig_dvs_beta, fig_dvs_res, fig_dvs_scatter_all, fig_dvs_scatter_r2,
@@ -980,63 +1022,95 @@ def update_all(country, m_long, m_short, spread_mode, window,
     )
 
 # =========================
-# Callback heatmap (only)
+# Callback heatmap + table
+#   (robuste même si pas de trades → heatmap zéro)
 # =========================
 @app.callback(
     Output("fig_heatmap", "figure"),
     Output("heatmap-note", "children"),
     Output("year-select", "options"),
     Output("year-select", "value"),
+    Output("trades-table", "data"),
+
     Input("store-trades", "data"),
     Input("store-pnl", "data"),
-)
-def update_heatmap(store_trades, store_pnl):
-    if not store_trades or not store_pnl:
-        return go.Figure(layout=go.Layout(template="plotly_white")), "", [], None
-
-    trades_df = pd.read_json(store_trades, orient="split")
-    pnl_tracker = pd.read_json(store_pnl, orient="split")
-
-    heatmap_fig, years_asc, _ = monthly_pnl_heatmap(trades_df, pnl_tracker)
-    note = ("Rows: Average + years; Columns: months. "
-            "Cell = PnL(k€) of portfolio made ONLY of trades entered that month (EOM − SOM).")
-
-    options = [{"label": str(y), "value": int(y)} for y in years_asc]
-    year_value = (years_asc[-1] if years_asc else None)
-    return heatmap_fig, note, options, year_value
-
-# =========================
-# Callback trades table (separate to avoid circular dep)
-# =========================
-@app.callback(
-    Output("trades-table", "data"),
-    Input("store-trades", "data"),
+    Input("country", "value"),
+    Input("matu-long", "value"),
+    Input("matu-short", "value"),
+    Input("spread-tenor-mode", "value"),
+    Input("bt-mode", "value"),
     Input("year-select", "value"),
-    State("country", "value"),
-    State("matu-long", "value"),
-    State("matu-short", "value"),
-    State("spread-tenor-mode", "value"),
-    State("bt-mode", "value"),
+    Input("window", "value"),
+    Input("lookback-bt", "value"),
 )
-def update_trades_table(store_trades, year_selected, country, m_long, m_short, spread_mode, bt_mode):
-    if not store_trades or (year_selected is None):
-        return []
+def update_heatmap_and_table(store_trades, store_pnl, country, m_long, m_short, spread_mode, bt_mode, year_selected, window, lookback_bt):
+    # If first run or no trades, still show a non-empty heatmap built from year range
+    if store_trades and store_pnl:
+        trades_df = pd.read_json(store_trades, orient="split")
+        pnl_tracker = pd.read_json(store_pnl, orient="split")
+    else:
+        trades_df = pd.DataFrame()
+        pnl_tracker = pd.DataFrame()
 
-    trades_df = pd.read_json(store_trades, orient="split")
-    sub = trades_df[trades_df["Entry"].dt.year == int(year_selected)].copy()
-    if sub.empty:
-        return []
+    # Build heatmap (if trades exist)
+    if not trades_df.empty and not pnl_tracker.empty:
+        heatmap_fig, years_asc, _ = monthly_pnl_heatmap(trades_df, pnl_tracker)
+        note = ("Rows: Average + years; Columns: months. "
+                "Cell = PnL(k€) of portfolio made ONLY of trades entered in that month (EOM − SOM).")
+        options = [{"label": str(y), "value": int(y)} for y in years_asc]
+        if (year_selected is None) or (year_selected not in years_asc):
+            year_selected = years_asc[-1] if years_asc else None
 
-    master = get_master_cached(country, m_long, m_short, DEFAULT_WINDOW, spread_mode)
-    if master is None:
-        return []
+        # Build stats table for selected year
+        if year_selected is None:
+            table_data = []
+        else:
+            master = get_master_cached(country, m_long, m_short, int(window), spread_mode) or pd.DataFrame()
+            sub = trades_df[trades_df["Entry"].dt.year == int(year_selected)].copy()
+            sub_stats = compute_trade_stats_table(sub, master, bt_mode)
+            if not sub_stats.empty:
+                sub_stats["Entry"] = pd.to_datetime(sub_stats["Entry"]).dt.strftime("%Y-%m-%d")
+                sub_stats["Exit"]  = pd.to_datetime(sub_stats["Exit"]).dt.strftime("%Y-%m-%d")
+            table_data = sub_stats.to_dict("records") if not sub_stats.empty else []
+        return heatmap_fig, note, options, year_selected, table_data
 
-    sub_stats = compute_trade_stats_table(sub, master, bt_mode)
-    if sub_stats.empty:
-        return []
-    sub_stats["Entry"] = pd.to_datetime(sub_stats["Entry"]).dt.strftime("%Y-%m-%d")
-    sub_stats["Exit"]  = pd.to_datetime(sub_stats["Exit"]).dt.strftime("%Y-%m-%d")
-    return sub_stats.to_dict("records")
+    # No trades → show zero heatmap for year range inside lookback window
+    master = get_master_cached(country, m_long, m_short, int(window), spread_mode) or pd.DataFrame()
+    master_bt = slice_by_years(master, int(lookback_bt)) if not master.empty else master
+    if not master_bt.empty:
+        years = sorted(master_bt.index.year.unique().tolist(), reverse=True)
+    else:
+        years = list(range(pd.Timestamp.today().year, pd.Timestamp.today().year-5, -1))
+
+    mat = pd.DataFrame(index=[str(y) for y in years], columns=MONTH_NAMES, dtype=float)
+    mat.loc[:, :] = 0.0
+    avg = pd.DataFrame([mat.mean(axis=0, numeric_only=True)], index=["Average"])
+    mat2 = pd.concat([avg, mat], axis=0)
+
+    z = mat2[MONTH_NAMES].values.astype(float)
+    text_vals = np.where(np.isfinite(z), np.round(z, 1), np.nan)
+    palette = [
+        [0.0,  "#7f0000"],
+        [0.2,  "#d7301f"],
+        [0.4,  "#fc8d59"],
+        [0.5,  "#f7f7f7"],
+        [0.6,  "#c7e9c0"],
+        [0.8,  "#1a9850"],
+        [1.0,  "#00441b"]
+    ]
+    fig = go.Figure(data=go.Heatmap(
+        z=z, x=MONTH_NAMES, y=list(mat2.index),
+        colorscale=palette, zmid=0, colorbar=dict(title="PnL (k€)"),
+        text=text_vals, texttemplate="%{text}", textfont={"color":"black","size":12},
+        hovertemplate="<b>%{y}</b> — %{x}<br>PnL: %{z:.1f} k€<extra></extra>",
+    ))
+    fig.update_layout(template="plotly_white",
+                      xaxis=dict(side="top"), yaxis=dict(autorange="reversed"),
+                      margin=dict(l=60,r=20,t=40,b=40))
+    note = "No trades under current thresholds — showing zeros by month/year."
+    options = [{"label": str(y), "value": int(y)} for y in sorted(years)]
+    year_selected = options[-1]["value"] if options else None
+    return fig, note, options, year_selected, []
 
 # =========================
 # Main
