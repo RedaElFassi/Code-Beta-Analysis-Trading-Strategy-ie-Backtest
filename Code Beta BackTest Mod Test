@@ -150,7 +150,7 @@ def build_master_dataframe(
         for suff in ["alpha","beta","r2","tstat","resid"]:
             master[f"{prefix}_{suff}_w{w}"] = np.nan
         join = pd.concat([master[ycol].rename("y"), master[xcol].rename("x")], axis=1).dropna()
-        if len(join) < w: 
+        if len(join) < w:
             return
         yv, xv, idx = join["y"].values, join["x"].values, join.index
         out = []
@@ -342,20 +342,17 @@ def monthly_pnl_heatmap(trades_df: pd.DataFrame, pnl_tracker: pd.DataFrame):
     if trades_df.empty or pnl_tracker.empty:
         return go.Figure(), [], pd.DataFrame()
 
-    # assure types
     trades_df = trades_df.copy()
     trades_df["Entry"] = pd.to_datetime(trades_df["Entry"])
     years = sorted(trades_df["Entry"].dt.year.unique().tolist())
     months = list(range(1,13))
 
-    # map Trade_i columns
     col_map = {i+1: f"Trade_{i+1:03d}" for i in range(len(trades_df))}
     trades_df["TradeIdx"] = trades_df.index + 1
 
     mat = pd.DataFrame(index=years, columns=months, dtype=float)
     for y in years:
         for m in months:
-            # portfolio composé UNIQUEMENT des trades entrés ce mois-là
             idxs = trades_df.loc[
                 (trades_df["Entry"].dt.year == y) & (trades_df["Entry"].dt.month == m),
                 "TradeIdx"
@@ -389,7 +386,7 @@ def monthly_pnl_heatmap(trades_df: pd.DataFrame, pnl_tracker: pd.DataFrame):
         hovertemplate="Month=%{x}<br>Row=%{y}<br>PnL=%{z:.1f}k€<extra></extra>"
     ))
     fig.update_layout(
-        title="Monthly PnL by Entry Month (portfolio of trades entered that month)",
+        title="Monthly PnL by Entry Month",
         template="plotly_white",
         margin=dict(l=60, r=20, t=60, b=40)
     )
@@ -402,7 +399,6 @@ def compute_trade_stats_table(trades_df: pd.DataFrame, master: pd.DataFrame, mod
     trades_df["Entry"] = pd.to_datetime(trades_df["Entry"])
     trades_df["Exit"]  = pd.to_datetime(trades_df["Exit"])
 
-    # series nécessaires
     if ("BOX_bps" not in master.columns) or ("SPREAD_bps" not in master.columns):
         return trades_df.assign(Return_%=np.nan, Vol_%=np.nan, Sharpe=np.nan)
 
@@ -535,7 +531,7 @@ def build_country_options(): return [{"label": c, "value": c} for c in AVAILABLE
 def build_maturity_options(): return [{"label": m, "value": m} for m in AVAILABLE_MATURITIES]
 
 app.layout = html.Div([
-    html.H2("📊 Box vs Spread/Curve — Regressions & Backtest (Dash)"),
+    html.H2("📊 Box vs Spread/Curve — Regressions & Backtest"),
     html.Div(id="warn-data", style={"color": "crimson", "marginBottom": "8px"}),
 
     # --- Selector bloc (haut) ---
@@ -562,7 +558,7 @@ app.layout = html.Div([
         ], style={"display": "inline-block", "marginRight": "24px"}),
 
         html.Div([
-            html.Label("Spread tenor used in regressions/backtest"),
+            html.Label("Spread tenor (regressions & BT)"),
             dcc.RadioItems(
                 id="spread-tenor-mode",
                 options=[
@@ -603,7 +599,8 @@ app.layout = html.Div([
     ], style={"width": "40%", "marginBottom": "10px"}),
 
     html.Hr(),
-    html.H3(id="title-lvs"),
+    html.H3("1) Box vs Spread — Levels"),
+    html.Div(id="subtitle-lvs", style={"color":"#555","marginTop":"-6px","marginBottom":"8px"}),
     html.Div([
         html.Div([dcc.Graph(id="fig_lvs_r2",   config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
         html.Div([dcc.Graph(id="fig_lvs_beta", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
@@ -617,8 +614,8 @@ app.layout = html.Div([
     ]),
 
     html.Hr(),
-    html.H3(id="title-lvc"),
-    html.Div(id="curve-note", style={"fontStyle":"italic", "color":"#555", "marginBottom":"8px"}),
+    html.H3("2) Box vs Curve — Levels"),
+    html.Div(id="curve-note", style={"color":"#555", "marginTop":"-6px","marginBottom":"8px"}),
     html.Div([
         html.Div([dcc.Graph(id="fig_lvc_r2",   config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
         html.Div([dcc.Graph(id="fig_lvc_beta", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
@@ -632,7 +629,8 @@ app.layout = html.Div([
     ]),
 
     html.Hr(),
-    html.H3(id="title-dvs"),
+    html.H3("3) Daily changes: ΔBox vs ΔSpread"),
+    html.Div(id="subtitle-dvs", style={"color":"#555","marginTop":"-6px","marginBottom":"8px"}),
     html.Div([
         html.Div([dcc.Graph(id="fig_dvs_r2",   config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
         html.Div([dcc.Graph(id="fig_dvs_beta", config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
@@ -662,7 +660,7 @@ app.layout = html.Div([
         ], style={"display": "inline-block", "marginRight": "24px"}),
     ], style={"marginBottom": "8px"}),
 
-    # --- Paramètres backtest (déplacés ici) ---
+    # --- Paramètres backtest (ICI) ---
     html.Div([
         html.Div([
             html.Label("Obs period L (days)"),
@@ -724,7 +722,7 @@ app.layout = html.Div([
         html.Div([dcc.Graph(id="fig_pnl_mtm",  config={"displaylogo": False})], style={"width": "49%", "display": "inline-block"}),
     ]),
 
-    html.H4("Monthly PnL heatmap (by entry month, within backtest lookback)"),
+    html.H4("Monthly PnL heatmap (by entry month, within BT lookback)"),
     dcc.Graph(id="fig_heatmap", config={"displaylogo": False}),
     html.Div(id="heatmap-note", style={"color":"#777", "fontStyle":"italic", "marginBottom":"8px"}),
 
@@ -754,10 +752,9 @@ app.layout = html.Div([
 @app.callback(
     Output("warn-data", "children"),
     Output("warn-maturity", "children"),
-    Output("title-lvs", "children"),
-    Output("title-lvc", "children"),
-    Output("title-dvs", "children"),
+    Output("subtitle-lvs", "children"),
     Output("curve-note", "children"),
+    Output("subtitle-dvs", "children"),
 
     Output("fig_lvs_r2", "figure"),
     Output("fig_lvs_beta", "figure"),
@@ -813,7 +810,7 @@ def update_all(country, m_long, m_short, spread_mode, window,
 
     if data is None:
         return ("No `data` DataFrame found. Provide it via `data_loader.py` or globally.",
-                "", "", "", "", "",
+                "", "", "", "",
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
@@ -825,7 +822,7 @@ def update_all(country, m_long, m_short, spread_mode, window,
 
     if (m_long not in AVAILABLE_MATURITIES) or (m_short not in AVAILABLE_MATURITIES):
         warn_m = "Select valid maturities."
-        return ("", warn_m, "", "", "", "",
+        return ("", warn_m, "", "", "",
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
@@ -835,7 +832,7 @@ def update_all(country, m_long, m_short, spread_mode, window,
         Lnum = int(m_long.replace("Y","")); Snum = int(m_short.replace("Y",""))
     except Exception:
         warn_m = "Maturity parsing error."
-        return ("", warn_m, "", "", "", "",
+        return ("", warn_m, "", "", "",
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
@@ -847,7 +844,7 @@ def update_all(country, m_long, m_short, spread_mode, window,
     # Build master + slices
     master_full = get_master_cached(country, m_long, m_short, int(window), spread_mode)
     if master_full is None or master_full.empty:
-        return ("", warn_m or "No data for this selection.", "", "", "", "",
+        return ("", warn_m or "No data for this selection.", "", "", "",
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
                 empty, empty, empty, empty, empty,
@@ -862,57 +859,56 @@ def update_all(country, m_long, m_short, spread_mode, window,
     lvc_r2, lvc_beta, lvc_res = f"lvl_curve_r2_w{w}", f"lvl_curve_beta_w{w}", f"lvl_curve_resid_w{w}"
     dvs_r2, dvs_beta, dvs_res = f"chg_spread_r2_w{w}", f"chg_spread_beta_w{w}", f"chg_spread_resid_w{w}"
 
-    # Titles
+    # Subtitles (courts)
     boxname = box_label(country, BASELINE_LOW_COUNTRY, m_short, m_long)
     spread_used = spread_tenor_label(spread_mode, m_long)
-    title_lvs = f"1) Regression of Box Level vs Spread Level — {boxname} — Spread tenor: {spread_used}"
-    title_lvc = f"2) Regression of Box Level vs Curve Level — {boxname}"
-    title_dvs = f"3) Regression of DAILY Box Changes vs DAILY Spread Changes — {boxname}"
-    curve_note = f"Curve used = {BENCHMARK_CURVE_COUNTRY} {m_short}s{m_long} (i.e., {m_long} − {m_short})"
+    subtitle_lvs = f"{boxname} — Spread tenor: {spread_used}"
+    curve_note = f"Curve: {BENCHMARK_CURVE_COUNTRY} {m_short}s{m_long} (={m_long}−{m_short})"
+    subtitle_dvs = f"{boxname} — Δ vs Spread (tenor: {spread_used})"
 
-    # Plots (levels & changes)
-    fig_lvs_r2   = fig_ts(master_plots[lvs_r2],   f"R² — BOX (bps) ~ SPREAD (bps) — window={w}", "R²")
-    fig_lvs_beta = fig_ts(master_plots[lvs_beta], f"Beta — BOX (bps) ~ SPREAD (bps) — window={w}", "Beta")
-    fig_lvs_res  = fig_ts(master_plots[lvs_res],  f"Residual (at window end) — BOX~SPREAD — window={w}", "Residual (bps)")
+    # Plots (levels & changes) — titres concis
+    fig_lvs_r2   = fig_ts(master_plots[lvs_r2],   f"R² — BOX~SPREAD (win={w})", "R²")
+    fig_lvs_beta = fig_ts(master_plots[lvs_beta], f"β — BOX~SPREAD (win={w})", "Beta")
+    fig_lvs_res  = fig_ts(master_plots[lvs_res],  f"Residual — BOX~SPREAD (win={w})", "Residual (bps)")
     fig_lvs_sc_all = fig_scatter_beta_year_heat(
         master_plots, beta_col=lvs_beta, x_level_col="SPREAD_bps",
-        title=f"Beta (Levels: BOX~SPREAD) vs SPREAD level — ALL — Spread tenor: {spread_used}",
+        title=f"β vs SPREAD level — ALL (tenor {spread_used})",
         xlab="Spread level (bps)", ylab="Beta"
     )
     fig_lvs_sc_r2  = fig_scatter_beta_year_heat(
         master_plots, beta_col=lvs_beta, x_level_col="SPREAD_bps", r2_col=lvs_r2, r2_min=float(r2_scatter),
-        title=f"Beta (Levels: BOX~SPREAD) vs SPREAD level — R² ≥ {float(r2_scatter):.2f} — Spread tenor: {spread_used}",
+        title=f"β vs SPREAD level — R² ≥ {float(r2_scatter):.2f} (tenor {spread_used})",
         xlab="Spread level (bps)", ylab="Beta"
     )
 
-    fig_lvc_r2   = fig_ts(master_plots[lvc_r2],   f"R² — BOX (bps) ~ CURVE (bps, DE {m_short}s{m_long}) — window={w}", "R²")
-    fig_lvc_beta = fig_ts(master_plots[lvc_beta], f"Beta — BOX (bps) ~ CURVE (bps, DE {m_short}s{m_long}) — window={w}", "Beta")
-    fig_lvc_res  = fig_ts(master_plots[lvc_res],  f"Residual (at window end) — BOX~CURVE — window={w}", "Residual (bps)")
+    fig_lvc_r2   = fig_ts(master_plots[lvc_r2],   f"R² — BOX~CURVE (win={w})", "R²")
+    fig_lvc_beta = fig_ts(master_plots[lvc_beta], f"β — BOX~CURVE (win={w})", "Beta")
+    fig_lvc_res  = fig_ts(master_plots[lvc_res],  f"Residual — BOX~CURVE (win={w})", "Residual (bps)")
     fig_lvc_sc_all = fig_scatter_beta_year_heat(
         master_plots, beta_col=lvc_beta, x_level_col="CURVE_bps",
-        title="Beta (Levels: BOX~CURVE) vs CURVE level — ALL", xlab="Curve level (bps)", ylab="Beta"
+        title="β vs CURVE level — ALL", xlab="Curve level (bps)", ylab="Beta"
     )
     fig_lvc_sc_r2  = fig_scatter_beta_year_heat(
         master_plots, beta_col=lvc_beta, x_level_col="CURVE_bps", r2_col=lvc_r2, r2_min=float(r2_scatter),
-        title=f"Beta (Levels: BOX~CURVE) vs CURVE level — R² ≥ {float(r2_scatter):.2f}",
+        title=f"β vs CURVE level — R² ≥ {float(r2_scatter):.2f}",
         xlab="Curve level (bps)", ylab="Beta"
     )
 
-    fig_dvs_r2   = fig_ts(master_plots[dvs_r2],   f"R² — ΔBOX ~ ΔSPREAD — window={w}", "R²")
-    fig_dvs_beta = fig_ts(master_plots[dvs_beta], f"Beta — ΔBOX ~ ΔSPREAD — window={w}", "Beta")
-    fig_dvs_res  = fig_ts(master_plots[dvs_res],  f"Residual (at window end) — ΔBOX~ΔSPREAD — window={w}", "Residual (bps)")
+    fig_dvs_r2   = fig_ts(master_plots[dvs_r2],   f"R² — ΔBOX~ΔSPREAD (win={w})", "R²")
+    fig_dvs_beta = fig_ts(master_plots[dvs_beta], f"β — ΔBOX~ΔSPREAD (win={w})", "Beta")
+    fig_dvs_res  = fig_ts(master_plots[dvs_res],  f"Residual — ΔBOX~ΔSPREAD (win={w})", "Residual (bps)")
     fig_dvs_sc_all = fig_scatter_beta_year_heat(
         master_plots, beta_col=dvs_beta, x_level_col="SPREAD_bps",
-        title=f"Beta (ΔBOX~ΔSPREAD) vs SPREAD level — ALL — Spread tenor: {spread_used}",
+        title=f"β(Δ) vs SPREAD level — ALL (tenor {spread_used})",
         xlab="Spread level (bps)", ylab="Beta"
     )
     fig_dvs_sc_r2  = fig_scatter_beta_year_heat(
         master_plots, beta_col=dvs_beta, x_level_col="SPREAD_bps", r2_col=dvs_r2, r2_min=float(r2_scatter),
-        title=f"Beta (ΔBOX~ΔSPREAD) vs SPREAD level — R² ≥ {float(r2_scatter):.2f} — Spread tenor: {spread_used}",
+        title=f"β(Δ) vs SPREAD level — R² ≥ {float(r2_scatter):.2f} (tenor {spread_used})",
         xlab="Spread level (bps)", ylab="Beta"
     )
 
-    # Backtest (BOX or PAIR)
+    # Backtest
     trades_df, pnl_tracker = backtest_from_master(
         master_bt, window=w, obs_window_days=int(obs), holding_days=int(hold),
         resid_threshold=float(eps_thr), r2_entry_threshold=float(r2_bt),
@@ -940,11 +936,10 @@ def update_all(country, m_long, m_short, spread_mode, window,
 
     bullets = html.Ul([
         html.Li(f"Signal: ε = BOX − (α + β·Spread_{spread_used}); entry if |ε| ≥ {float(eps_thr):.2f} bps & R² ≥ {float(r2_bt):.2f}."),
-        html.Li(f"Params: window={w}d, L={int(obs)}d (delay), H={int(hold)}d (max holding), cooldown={int(cooldown)}d."),
-        html.Li("Stops: on the traded underlier (BOX or BOX−β·SPREAD), TP/SL = ±(mult × ε)."),
+        html.Li(f"Params: window={w}d, L={int(obs)}d, H={int(hold)}d, cooldown={int(cooldown)}d."),
+        html.Li("Stops: on traded underlier (BOX or BOX−β·SPREAD), TP/SL = ±(mult × ε)."),
         html.Li("Modes: BOX (only Box) vs PAIR (Box − β·Spread) with β frozen at entry."),
-        html.Li(f"Spread tenor used: {spread_used}. Box: {m_short.lower()}s{m_long} {country} vs {BASELINE_LOW_COUNTRY}."),
-        html.Li(f"DV01 per trade = {DV01_K:.0f} k€; portfolio MtM is the sum of live-trades MtM."),
+        html.Li(f"Box: {boxname}; Spread tenor: {spread_used}. DV01 per trade = {DV01_K:.0f} k€."),
     ])
 
     store_trades = trades_df.to_json(date_format="iso", orient="split") if not trades_df.empty else None
@@ -952,10 +947,10 @@ def update_all(country, m_long, m_short, spread_mode, window,
     warn_end = f"Backtest lookback = {int(lookback_bt)}y | Plots lookback = {int(lookback_plots)}y."
 
     return (
-        "", warn_m, title_lvs, title_lvc, title_dvs, curve_note,
-        fig_lvs_r2, fig_lvs_beta, fig_lvs_res, fig_lvs_scatter_all, fig_lvs_sc_r2,
-        fig_lvc_r2, fig_lvc_beta, fig_lvc_res, fig_lvc_scatter_all, fig_lvc_sc_r2,
-        fig_dvs_r2, fig_dvs_beta, fig_dvs_res, fig_dvs_scatter_all, fig_dvs_sc_r2,
+        "", warn_m, subtitle_lvs, curve_note, subtitle_dvs,
+        fig_lvs_r2, fig_lvs_beta, fig_lvs_res, fig_lvs_scatter_all, fig_lvs_scatter_r2,
+        fig_lvc_r2, fig_lvc_beta, fig_lvc_res, fig_lvc_scatter_all, fig_lvc_scatter_r2,
+        fig_dvs_r2, fig_dvs_beta, fig_dvs_res, fig_dvs_scatter_all, fig_dvs_scatter_r2,
         fig_pnl_real, fig_pnl_mtm, bullets,
         store_trades, store_pnl, warn_end
     )
@@ -979,10 +974,12 @@ def update_all(country, m_long, m_short, spread_mode, window,
     Input("spread-tenor-mode", "value"),
     Input("window", "value"),
     Input("bt-mode", "value"),
-    Input("year-select", "value")
+
+    State("year-select", "value")  # IMPORTANT: State, pas Input -> pas de boucle
 )
 def update_heatmap_and_table(store_trades, store_pnl,
-                             country, m_long, m_short, spread_mode, window, bt_mode, year_selected):
+                             country, m_long, m_short, spread_mode, window, bt_mode,
+                             year_selected):
     if not store_trades or not store_pnl:
         return go.Figure(), "", [], None, []
 
@@ -1000,8 +997,7 @@ def update_heatmap_and_table(store_trades, store_pnl,
         master = pd.DataFrame(index=pnl_tracker.index)
 
     heatmap_fig, years, _ = monthly_pnl_heatmap(trades_df, pnl_tracker)
-    note = ("Rows = years (+ 'MonthlyAvg'); columns = months; cell = PnL(k€) of a portfolio "
-            "made only of trades ENTERED in that month.")
+    note = "Rows = years (+ 'MonthlyAvg'); columns = months; cell = PnL(k€) of portfolio made only of trades ENTERED in that month."
 
     options = [{"label": str(y), "value": int(y)} for y in years]
     if (year_selected is None) or (year_selected not in years):
@@ -1030,7 +1026,7 @@ if __name__ == "__main__":
         finally: s.close()
         return ip
 
-    host, port = "0.0.0.0", 8055
+    host, port = "0.0.0.0", 8057
     local_ip = get_local_ip()
     print("\n================= SHARE THIS =================")
     print(f"Local (toi)    : http://localhost:{port}")
@@ -1039,3 +1035,4 @@ if __name__ == "__main__":
     try: webbrowser.open(f"http://localhost:{port}")
     except Exception: pass
     app.run_server(host=host, port=port, debug=False)
+
